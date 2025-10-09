@@ -58,9 +58,9 @@ jobs:
     - name: Deploy to EC2
       uses: appleboy/ssh-action@master
       with:
-        host: ${{ secrets.HOST_IP }}
-        username: ${{ secrets.DOCKER_HUB_USERNAME }}
-        key: ${{ secrets.HOST_SSH_KEY }}
+        host: ${{ secrets.PROD_HOST }}
+        username: ywgx
+        key: ${{ secrets.PROD_KEY }}
         script: |
           cd /home/${{ secrets.DOCKER_HUB_USERNAME }}/1/${{ env.REPO_NAME }}
           docker-compose down
