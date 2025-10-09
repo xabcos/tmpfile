@@ -221,18 +221,3 @@ The application runs as non-root user. Ensure volumes have correct permissions:
 ```bash
 docker run --rm -v tmpfile_uploads_data:/vol busybox chown -R 65532:65532 /vol
 ```
-
-### Redis Connection Failed
-
-Check Redis is accessible:
-```bash
-docker exec tmpfile ping -c 1 redis
-```
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions welcome! Please open an issue or PR.
