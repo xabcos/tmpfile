@@ -7,8 +7,9 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
-use rand::Rng;
-use redis::{aio::Connection, AsyncCommands, Client};
+use parking_lot::RwLock;
+use rand::{thread_rng, Rng};
+use redis::{aio::ConnectionManager, AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -23,11 +24,11 @@ use std::{
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
-    sync::{Mutex, RwLock},
     time::interval,
 };
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
+use tracing::{debug, error, info, warn};
 
 // ===========================
 // Configuration Constants
@@ -113,17 +114,14 @@ struct MemoryStore {
 
 impl MemoryStore {
     fn new() -> Self {
-        let mut shards = Vec::with_capacity(MEMORY_SHARD_COUNT);
-        for _ in 0..MEMORY_SHARD_COUNT {
-            shards.push(Arc::new(RwLock::new(HashMap::new())));
-        }
+        let shards = (0..MEMORY_SHARD_COUNT)
+            .map(|_| Arc::new(RwLock::new(HashMap::new())))
+            .collect();
         Self { shards }
     }
 
     fn get_shard_for_token(&self, token: &str) -> &MemoryShard {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&token, &mut hasher);
-        let hash = std::hash::Hasher::finish(&hasher);
+        let hash = token.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
         &self.shards[(hash as usize) % MEMORY_SHARD_COUNT]
     }
 }
@@ -132,7 +130,7 @@ impl MemoryStore {
 impl MetadataStore for MemoryStore {
     async fn save(&self, token: &str, metadata: FileMetadata, ttl: StdDuration) -> Result<(), String> {
         let shard = self.get_shard_for_token(token);
-        let mut guard = shard.write().await;
+        let mut guard = shard.write();
         let expires_at = Utc::now() + Duration::from_std(ttl).unwrap();
         guard.insert(token.to_string(), (metadata, expires_at));
         Ok(())
@@ -140,27 +138,23 @@ impl MetadataStore for MemoryStore {
 
     async fn load(&self, token: &str) -> Result<FileMetadata, String> {
         let shard = self.get_shard_for_token(token);
-        let guard = shard.read().await;
-
-        match guard.get(token) {
-            Some((metadata, _)) => Ok(metadata.clone()),
-            None => Err("file not found".to_string()),
-        }
+        let guard = shard.read();
+        guard.get(token)
+            .map(|(metadata, _)| metadata.clone())
+            .ok_or_else(|| "file not found".to_string())
     }
 
     async fn increment_downloads(&self, token: &str) -> Result<i32, String> {
         let shard = self.get_shard_for_token(token);
-        let guard = shard.read().await;
-
-        match guard.get(token) {
-            Some((metadata, _)) => Ok(metadata.increment_download_count()),
-            None => Err("file not found".to_string()),
-        }
+        let guard = shard.read();
+        guard.get(token)
+            .map(|(metadata, _)| metadata.increment_download_count())
+            .ok_or_else(|| "file not found".to_string())
     }
 
     async fn remove(&self, token: &str) -> Result<(), String> {
         let shard = self.get_shard_for_token(token);
-        let mut guard = shard.write().await;
+        let mut guard = shard.write();
         guard.remove(token);
         Ok(())
     }
@@ -169,16 +163,14 @@ impl MetadataStore for MemoryStore {
         let mut tokens = Vec::new();
         let mut metadata = Vec::new();
         let now = Utc::now();
-        let mut collected = 0;
 
         for shard in &self.shards {
-            let guard = shard.read().await;
+            let guard = shard.read();
             for (token, (meta, expires_at)) in guard.iter() {
                 if now > *expires_at || now > meta.expires_at {
                     tokens.push(token.clone());
                     metadata.push(meta.clone());
-                    collected += 1;
-                    if collected >= limit {
+                    if tokens.len() >= limit {
                         return Ok((tokens, metadata));
                     }
                 }
@@ -194,7 +186,7 @@ impl MetadataStore for MemoryStore {
 // ===========================
 
 struct RedisStore {
-    client: Client,
+    conn_manager: ConnectionManager,
 }
 
 impl RedisStore {
@@ -202,54 +194,45 @@ impl RedisStore {
         let client = Client::open(format!("redis://{}/{}", addr, db))
             .map_err(|e| format!("Failed to create Redis client: {}", e))?;
 
-        // Test connection
-        let mut conn = client.get_async_connection().await
+        let conn_manager = ConnectionManager::new(client)
+            .await
             .map_err(|e| format!("Redis connection failed: {}", e))?;
 
+        // Test connection
+        let mut conn = conn_manager.clone();
         redis::cmd("PING")
-            .query_async::<_, String>(&mut conn)
+            .query_async::<String>(&mut conn)
             .await
             .map_err(|e| format!("Redis ping failed: {}", e))?;
 
-        Ok(Self { client })
-    }
-
-    async fn get_connection(&self) -> Result<Connection, String> {
-        self.client
-            .get_async_connection()
-            .await
-            .map_err(|e| format!("Failed to get Redis connection: {}", e))
+        info!("Redis connection established");
+        Ok(Self { conn_manager })
     }
 
     fn metadata_key(&self, token: &str) -> String {
         format!("file:meta:{}", token)
     }
 
-    fn expiry_set_key(&self) -> &'static str {
-        "file:expiry:set"
-    }
+    const EXPIRY_SET_KEY: &'static str = "file:expiry:set";
 }
 
 #[async_trait::async_trait]
 impl MetadataStore for RedisStore {
     async fn save(&self, token: &str, metadata: FileMetadata, ttl: StdDuration) -> Result<(), String> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn_manager.clone();
 
-        // Serialize metadata without Arc
         let serializable = SerializableMetadata::from(&metadata);
         let data = serde_json::to_string(&serializable)
             .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
 
-        // Use pipeline for atomic operations
         let key = self.metadata_key(token);
-        let expiry_key = self.expiry_set_key();
-        let ttl_secs = ttl.as_secs() as usize;
+        let ttl_secs = ttl.as_secs() as u64;
 
         redis::pipe()
             .atomic()
             .set_ex(&key, data, ttl_secs)
-            .zadd(expiry_key, token, metadata.expires_at.timestamp())
-            .query_async::<_, ()>(&mut conn)
+            .zadd(Self::EXPIRY_SET_KEY, token, metadata.expires_at.timestamp())
+            .query_async::<()>(&mut conn)
             .await
             .map_err(|e| format!("Failed to save to Redis: {}", e))?;
 
@@ -257,7 +240,7 @@ impl MetadataStore for RedisStore {
     }
 
     async fn load(&self, token: &str) -> Result<FileMetadata, String> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
 
         let data: String = conn.get(&key).await
@@ -276,29 +259,25 @@ impl MetadataStore for RedisStore {
     }
 
     async fn increment_downloads(&self, token: &str) -> Result<i32, String> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
 
-        // Get current metadata
         let data: String = conn.get(&key).await
             .map_err(|_| "file not found".to_string())?;
 
         let mut metadata: SerializableMetadata = serde_json::from_str(&data)
             .map_err(|e| format!("Failed to deserialize metadata: {}", e))?;
 
-        // Increment download count
         metadata.download_count += 1;
         let new_count = metadata.download_count;
 
-        // Save back with current TTL
         let ttl: i64 = conn.ttl(&key).await
             .map_err(|e| format!("Failed to get TTL: {}", e))?;
 
         if ttl > 0 {
             let new_data = serde_json::to_string(&metadata)
                 .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
-
-            conn.set_ex::<_, _, ()>(&key, new_data, ttl as usize).await
+            conn.set_ex::<_, _, ()>(&key, new_data, ttl as u64).await
                 .map_err(|e| format!("Failed to update metadata: {}", e))?;
         }
 
@@ -306,15 +285,14 @@ impl MetadataStore for RedisStore {
     }
 
     async fn remove(&self, token: &str) -> Result<(), String> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
-        let expiry_key = self.expiry_set_key();
 
         redis::pipe()
             .atomic()
             .del(&key)
-            .zrem(expiry_key, token)
-            .query_async::<_, ()>(&mut conn)
+            .zrem(Self::EXPIRY_SET_KEY, token)
+            .query_async::<()>(&mut conn)
             .await
             .map_err(|e| format!("Failed to remove from Redis: {}", e))?;
 
@@ -322,13 +300,11 @@ impl MetadataStore for RedisStore {
     }
 
     async fn list_expired(&self, limit: usize) -> Result<(Vec<String>, Vec<FileMetadata>), String> {
-        let mut conn = self.get_connection().await?;
-        let expiry_key = self.expiry_set_key();
+        let mut conn = self.conn_manager.clone();
         let now = Utc::now().timestamp();
 
-        // Get expired tokens
         let tokens: Vec<String> = conn
-            .zrangebyscore_limit(expiry_key, 0, now, 0, limit as isize)
+            .zrangebyscore_limit(Self::EXPIRY_SET_KEY, 0, now, 0, limit as isize)
             .await
             .map_err(|e| format!("Failed to get expired tokens: {}", e))?;
 
@@ -336,7 +312,6 @@ impl MetadataStore for RedisStore {
             return Ok((vec![], vec![]));
         }
 
-        // Batch fetch metadata
         let mut valid_tokens = Vec::new();
         let mut metadata_list = Vec::new();
 
@@ -401,39 +376,16 @@ impl From<SerializableMetadata> for FileMetadata {
 // Token Generation
 // ===========================
 
-struct TokenGenerator {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    buffer_idx: Arc<Mutex<usize>>,
-}
+struct TokenGenerator;
 
 impl TokenGenerator {
-    fn new() -> Self {
-        let mut buffer = vec![0u8; 1024];
-        rand::rng().fill(&mut buffer[..]);
-
-        Self {
-            buffer: Arc::new(Mutex::new(buffer)),
-            buffer_idx: Arc::new(Mutex::new(0)),
-        }
-    }
-
-    async fn generate(&self) -> String {
-        let mut random_part = String::with_capacity(TOKEN_LENGTH);
+    fn generate() -> String {
+        let mut rng = thread_rng();
         let charset: Vec<char> = TOKEN_CHARSET.chars().collect();
 
-        let mut buffer = self.buffer.lock().await;
-        let mut idx = self.buffer_idx.lock().await;
-
-        for _ in 0..TOKEN_LENGTH {
-            if *idx >= buffer.len() {
-                rand::rng().fill(&mut buffer[..]);
-                *idx = 0;
-            }
-
-            let char_idx = buffer[*idx] as usize % charset.len();
-            random_part.push(charset[char_idx]);
-            *idx += 1;
-        }
+        let random_part: String = (0..TOKEN_LENGTH)
+            .map(|_| charset[rng.gen_range(0..charset.len())])
+            .collect();
 
         let time_part = Utc::now().format(TOKEN_TIME_FORMAT).to_string();
         format!("{}{}", random_part, time_part)
@@ -465,49 +417,36 @@ struct ServerConfig {
 struct FileServer {
     config: Arc<ServerConfig>,
     store: Arc<dyn MetadataStore>,
-    token_generator: Arc<TokenGenerator>,
 }
 
 impl FileServer {
     async fn new(config: ServerConfig) -> Result<Self, String> {
-        // Initialize storage backend
         let store: Arc<dyn MetadataStore> = if let Some(redis_addr) = &config.redis_addr {
             let redis_store = RedisStore::new(redis_addr, config.redis_db).await?;
-            println!("Using Redis storage backend at {}", redis_addr);
+            info!("Using Redis storage backend at {}", redis_addr);
             Arc::new(redis_store)
         } else {
-            println!("Using in-memory storage backend");
+            info!("Using in-memory storage backend");
             Arc::new(MemoryStore::new())
         };
 
         Ok(Self {
             config: Arc::new(config),
             store,
-            token_generator: Arc::new(TokenGenerator::new()),
         })
     }
 
     async fn initialize_storage(&self) -> Result<(), String> {
-        // Create main upload directory
         fs::create_dir_all(&self.config.upload_dir).await
             .map_err(|e| format!("Failed to create upload directory: {}", e))?;
 
-        // Create subdirectories for better file distribution
-        for i in 0..TOKEN_CHARSET.len() {
-            for j in 0..TOKEN_CHARSET.len() {
-                let chars: Vec<char> = TOKEN_CHARSET.chars().collect();
-                let subdir = format!("{}{}", chars[i], chars[j]);
-                let path = PathBuf::from(&self.config.upload_dir).join(&subdir);
-                fs::create_dir_all(&path).await
-                    .map_err(|e| format!("Failed to create subdirectory {}: {}", subdir, e))?;
-            }
-        }
-
+        // Subdirectories will be created on-demand when saving files
+        debug!("Upload directory initialized at: {}", self.config.upload_dir);
         Ok(())
     }
 
     async fn startup_cleanup(&self) -> Result<(), String> {
-        println!("Starting cleanup of orphaned files...");
+        info!("Starting cleanup of orphaned files...");
         let start_time = std::time::Instant::now();
         let mut cleaned_count = 0;
         let mut total_size = 0i64;
@@ -516,7 +455,6 @@ impl FileServer {
         let mut entries = fs::read_dir(&self.config.upload_dir).await
             .map_err(|e| format!("Failed to read upload directory: {}", e))?;
 
-        // Process all subdirectories
         while let Some(entry) = entries.next_entry().await
             .map_err(|e| format!("Failed to read directory entry: {}", e))? {
 
@@ -539,7 +477,7 @@ impl FileServer {
                             }
                             Err(e) => {
                                 error_count += 1;
-                                eprintln!("Error cleaning file {:?}: {}", file_path, e);
+                                error!("Error cleaning file {:?}: {}", file_path, e);
                             }
                         }
                     }
@@ -548,7 +486,7 @@ impl FileServer {
         }
 
         let duration = start_time.elapsed();
-        println!(
+        info!(
             "Startup cleanup completed in {:?}: removed {} orphaned files ({:.2} MB), {} errors",
             duration,
             cleaned_count,
@@ -564,22 +502,19 @@ impl FileServer {
             .and_then(|n| n.to_str())
             .ok_or_else(|| "Invalid filename".to_string())?;
 
-        // Extract token from filename
         let token = if filename.len() >= 16 {
             &filename[..16]
         } else {
-            println!("Found unrecognized file: {:?}", path);
+            debug!("Found unrecognized file: {:?}", path);
             return Ok((false, 0));
         };
 
-        // Check if metadata exists
         match self.store.load(token).await {
             Ok(metadata) => {
                 let now = Utc::now();
 
-                // Check if file is expired
                 if now > metadata.expires_at {
-                    println!("Found expired file: {:?} (expired at {})", path, metadata.expires_at);
+                    debug!("Found expired file: {:?} (expired at {})", path, metadata.expires_at);
                     let size = metadata.size;
                     fs::remove_file(path).await
                         .map_err(|e| format!("Failed to remove expired file: {}", e))?;
@@ -587,9 +522,8 @@ impl FileServer {
                     return Ok((true, size));
                 }
 
-                // Check download limit
                 if metadata.download_limit > 0 && metadata.get_download_count() >= metadata.download_limit {
-                    println!(
+                    debug!(
                         "Found file exceeding download limit: {:?} ({}/{})",
                         path,
                         metadata.get_download_count(),
@@ -605,8 +539,7 @@ impl FileServer {
                 Ok((false, 0))
             }
             Err(_) => {
-                // No metadata found, file is orphaned
-                println!("Found orphaned file (no metadata): {:?}", path);
+                debug!("Found orphaned file (no metadata): {:?}", path);
                 let metadata = fs::metadata(path).await
                     .map_err(|e| format!("Failed to get file metadata: {}", e))?;
                 let size = metadata.len() as i64;
@@ -632,13 +565,11 @@ impl FileServer {
         let storage_path = self.get_storage_path(token);
         let full_path = PathBuf::from(format!("{}{}", storage_path.display(), extension));
 
-        // Ensure directory exists
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await
                 .map_err(|e| format!("Failed to create directory: {}", e))?;
         }
 
-        // Write file
         let mut file = File::create(&full_path).await
             .map_err(|e| format!("Failed to create file: {}", e))?;
 
@@ -662,15 +593,15 @@ impl FileServer {
     async fn remove_file(&self, token: &str, metadata: &FileMetadata) {
         if let Err(e) = fs::remove_file(&metadata.storage_path).await {
             if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("Failed to remove file {}: {}", metadata.storage_path, e);
+                error!("Failed to remove file {}: {}", metadata.storage_path, e);
             }
         }
 
         if let Err(e) = self.store.remove(token).await {
-            eprintln!("Failed to remove metadata for token {}: {}", token, e);
+            error!("Failed to remove metadata for token {}: {}", token, e);
         }
 
-        println!("Removed: {} -> {}", metadata.original_name, token);
+        info!("Removed: {} -> {}", metadata.original_name, token);
     }
 
     async fn cleanup_worker(server: Arc<FileServer>) {
@@ -692,29 +623,28 @@ impl FileServer {
 
                     let count = tokens.len();
 
-                    // Remove files concurrently
-                    let mut tasks = Vec::new();
-                    for (token, metadata) in tokens.into_iter().zip(metadata_list.into_iter()) {
-                        let server = self.clone();
-                        let token_clone = token.clone();
-                        tasks.push(tokio::spawn(async move {
-                            server.remove_file(&token_clone, &metadata).await;
-                        }));
-                    }
+                    let tasks: Vec<_> = tokens.into_iter()
+                        .zip(metadata_list.into_iter())
+                        .map(|(token, metadata)| {
+                            let server = self.clone();
+                            tokio::spawn(async move {
+                                server.remove_file(&token, &metadata).await;
+                            })
+                        })
+                        .collect();
 
-                    // Wait for all removals to complete
                     for task in tasks {
                         let _ = task.await;
                     }
 
-                    println!("Cleaned up {} expired files", count);
+                    info!("Cleaned up {} expired files", count);
 
                     if count < CLEANUP_BATCH_SIZE {
                         break;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Cleanup error: {}", e);
+                    error!("Cleanup error: {}", e);
                     break;
                 }
             }
@@ -731,7 +661,6 @@ async fn handle_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Validate API key if configured
     if let Some(api_key) = &server.config.api_key {
         let auth_header = headers
             .get("authorization")
@@ -744,7 +673,6 @@ async fn handle_upload(
         }
     }
 
-    // Process multipart form
     while let Some(field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
         if field.name() == Some("file") {
             let filename = field.file_name()
@@ -755,23 +683,19 @@ async fn handle_upload(
                 continue;
             }
 
-            // Read file data
             let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
 
-            // Check file size
             if data.len() > server.config.max_file_size as usize {
                 return Err(StatusCode::PAYLOAD_TOO_LARGE);
             }
 
-            // Generate token and save file
-            let token = server.token_generator.generate().await;
+            let token = TokenGenerator::generate();
             let metadata = server.save_file(&token, data, &filename).await
                 .map_err(|e| {
-                    eprintln!("Failed to save file: {}", e);
+                    error!("Failed to save file: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            // Store metadata
             let ttl = if server.config.redis_addr.is_some() {
                 server.config.file_expiration + server.config.cleanup_interval
             } else {
@@ -780,13 +704,11 @@ async fn handle_upload(
 
             server.store.save(&token, metadata.clone(), ttl.to_std().unwrap()).await
                 .map_err(|e| {
-                    eprintln!("Failed to save metadata: {}", e);
-                    // Clean up the file if metadata save fails
+                    error!("Failed to save metadata: {}", e);
                     let _ = fs::remove_file(&metadata.storage_path);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            // Build response
             let scheme = if headers.get("x-forwarded-proto").map(|v| v == "https").unwrap_or(false) {
                 "https"
             } else {
@@ -813,7 +735,7 @@ async fn handle_upload(
                 response.remaining_downloads = Some(server.config.max_download_count);
             }
 
-            println!(
+            info!(
                 "Uploaded: {} ({:.2}MB) -> {}",
                 metadata.original_name,
                 metadata.size as f64 / (1024.0 * 1024.0),
@@ -831,42 +753,36 @@ async fn handle_download(
     State(server): State<Arc<FileServer>>,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Extract token from path
     let token = if path.len() >= 16 {
-        path[..16].to_string()  // 转换为 String 而不是 &str
+        &path[..16]
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    // Load metadata
-    let metadata = server.store.load(&token).await  // 使用 &token
+    let metadata = server.store.load(token).await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // Validate expiration
     if Utc::now() > metadata.expires_at {
         return Err(StatusCode::GONE);
     }
 
-    // Validate download limit
     if metadata.download_limit > 0 && metadata.get_download_count() >= metadata.download_limit {
         let server_clone = server.clone();
-        let token_clone = token.clone();  // 克隆 token
+        let token_owned = token.to_string();
         let metadata_clone = metadata.clone();
         tokio::spawn(async move {
-            server_clone.remove_file(&token_clone, &metadata_clone).await;
+            server_clone.remove_file(&token_owned, &metadata_clone).await;
         });
         return Err(StatusCode::GONE);
     }
 
-    // Read file
     let file_data = fs::read(&metadata.storage_path).await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    // Update download count
-    let new_count = server.store.increment_downloads(&token).await  // 使用 &token
+    let new_count = server.store.increment_downloads(token).await
         .unwrap_or(metadata.get_download_count() + 1);
 
-    println!(
+    info!(
         "Download: {} -> {} (count: {}/{})",
         metadata.original_name,
         token,
@@ -874,17 +790,15 @@ async fn handle_download(
         if metadata.download_limit > 0 { metadata.download_limit.to_string() } else { "unlimited".to_string() }
     );
 
-    // Remove file if download limit reached
     if metadata.download_limit > 0 && new_count >= metadata.download_limit {
         let server_clone = server.clone();
-        let token_clone = token.clone();  // 克隆 token 而不是直接使用
+        let token_owned = token.to_string();
         let metadata_clone = metadata.clone();
         tokio::spawn(async move {
-            server_clone.remove_file(&token_clone, &metadata_clone).await;
+            server_clone.remove_file(&token_owned, &metadata_clone).await;
         });
     }
 
-    // Build response with HeaderMap
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
     headers.insert(
@@ -910,23 +824,21 @@ fn parse_env_duration(key: &str, default: i64) -> Duration {
     env::var(key)
         .ok()
         .and_then(|v| {
-            // Try parsing as seconds
             v.parse::<i64>().ok().map(Duration::seconds)
                 .or_else(|| {
-                    // Try parsing duration string (e.g., "36h", "1d", etc.)
                     if v.ends_with('h') {
-                        v[..v.len()-1].parse::<i64>().ok().map(|h| Duration::hours(h))
+                        v[..v.len()-1].parse::<i64>().ok().map(Duration::hours)
                     } else if v.ends_with('d') {
-                        v[..v.len()-1].parse::<i64>().ok().map(|d| Duration::days(d))
+                        v[..v.len()-1].parse::<i64>().ok().map(Duration::days)
                     } else if v.ends_with('m') {
-                        v[..v.len()-1].parse::<i64>().ok().map(|m| Duration::minutes(m))
+                        v[..v.len()-1].parse::<i64>().ok().map(Duration::minutes)
                     } else {
                         None
                     }
                 })
         })
         .unwrap_or_else(|| {
-            println!("Using default {} seconds for {}", default, key);
+            info!("Using default {} seconds for {}", default, key);
             Duration::seconds(default)
         })
 }
@@ -936,7 +848,7 @@ fn parse_env_int(key: &str, default: i32) -> i32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| {
-            println!("Using default {} for {}", default, key);
+            info!("Using default {} for {}", default, key);
             default
         })
 }
@@ -946,7 +858,7 @@ fn parse_env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| {
-            println!("Using default {} for {}", default, key);
+            info!("Using default {} for {}", default, key);
             default
         })
 }
@@ -957,7 +869,13 @@ fn parse_env_u64(key: &str, default: u64) -> u64 {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load configuration from environment
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
+
     let config = ServerConfig {
         listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_string()),
         upload_dir: env::var("UPLOAD_DIR").unwrap_or_else(|_| DEFAULT_UPLOAD_DIR.to_string()),
@@ -970,50 +888,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         redis_db: env::var("REDIS_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
     };
 
-    println!("File server starting on {}", config.listen_addr);
-    println!(
-        "Configuration: MaxFileSize={}MB, FileExpiration={}, MaxDownloads={}",
+    info!("File server starting on {}", config.listen_addr);
+    info!(
+        "Configuration: MaxFileSize={}MB, FileExpiration={}h, MaxDownloads={}",
         config.max_file_size / (1024 * 1024),
         config.file_expiration.num_hours(),
-        config.max_download_count
+        if config.max_download_count > 0 { config.max_download_count.to_string() } else { "unlimited".to_string() }
     );
 
     if config.api_key.is_some() {
-        println!("API authentication enabled");
+        info!("API authentication enabled");
     }
 
-    // Create server
     let server = Arc::new(FileServer::new(config.clone()).await?);
 
-    // Initialize storage
     server.initialize_storage().await?;
 
-    // Startup cleanup
     if let Err(e) = server.startup_cleanup().await {
-        eprintln!("Warning: startup cleanup encountered errors: {}", e);
+        warn!("Startup cleanup encountered errors: {}", e);
     }
 
-    // Start cleanup worker
     let cleanup_server = server.clone();
     tokio::spawn(async move {
         FileServer::cleanup_worker(cleanup_server).await;
     });
 
-    // Build router
     let app = Router::new()
         .route("/upload", post(handle_upload))
-        .route("/files/*path", get(handle_download))
+        .route("/files/{path}", get(handle_download))
         .layer(
             ServiceBuilder::new()
                 .layer(RequestBodyLimitLayer::new(config.max_file_size as usize))
         )
         .with_state(server);
 
-    // Start server
-    let addr = config.listen_addr.parse()?;
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await?;
+    let addr: std::net::SocketAddr = config.listen_addr.parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("Server listening on {}", addr);
+
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
