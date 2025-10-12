@@ -9,11 +9,11 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use rand::{Rng, distributions::Uniform, thread_rng};
-use redis::{AsyncCommands, Client, Script, aio::ConnectionManager};
+use redis::{AsyncCommands, Client, RedisError, Script, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    env,
+    env, fmt,
     path::PathBuf,
     sync::{
         Arc,
@@ -31,7 +31,7 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // ===========================
 // Configuration Constants
@@ -119,6 +119,41 @@ struct ListFilesResponse {
     total_pages: usize,
 }
 
+#[derive(Debug)]
+enum MetadataError {
+    NotFound,
+    Backend(String),
+    Serialization(String),
+    Deserialization(String),
+}
+
+impl fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetadataError::NotFound => write!(f, "file not found"),
+            MetadataError::Backend(err) => write!(f, "{err}"),
+            MetadataError::Serialization(err) => write!(f, "serialization error: {err}"),
+            MetadataError::Deserialization(err) => write!(f, "deserialization error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for MetadataError {}
+
+impl From<RedisError> for MetadataError {
+    fn from(error: RedisError) -> Self {
+        MetadataError::Backend(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for MetadataError {
+    fn from(error: serde_json::Error) -> Self {
+        MetadataError::Deserialization(error.to_string())
+    }
+}
+
+type MetadataResult<T> = Result<T, MetadataError>;
+
 #[async_trait::async_trait]
 trait MetadataStore: Send + Sync {
     async fn save(
@@ -126,18 +161,55 @@ trait MetadataStore: Send + Sync {
         token: &str,
         metadata: FileMetadata,
         ttl: StdDuration,
-    ) -> Result<(), String>;
-    async fn load(&self, token: &str) -> Result<FileMetadata, String>;
-    async fn increment_downloads(&self, token: &str) -> Result<i32, String>;
-    async fn remove(&self, token: &str) -> Result<(), String>;
-    async fn list_expired(&self, limit: usize) -> Result<(Vec<String>, Vec<FileMetadata>), String>;
+    ) -> MetadataResult<()>;
+    async fn load(&self, token: &str) -> MetadataResult<FileMetadata>;
+    async fn increment_downloads(&self, token: &str) -> MetadataResult<i32>;
+    async fn remove(&self, token: &str) -> MetadataResult<()>;
+    async fn list_expired(&self, limit: usize) -> MetadataResult<(Vec<String>, Vec<FileMetadata>)>;
     async fn list_files(
         &self,
         offset: usize,
         limit: usize,
         sort_by: &str,
         desc: bool,
-    ) -> Result<(Vec<(String, FileMetadata)>, usize), String>;
+    ) -> MetadataResult<(Vec<(String, FileMetadata)>, usize)>;
+}
+
+fn sort_and_paginate_files(
+    files: &mut Vec<(String, FileMetadata)>,
+    offset: usize,
+    limit: usize,
+    sort_by: &str,
+    desc: bool,
+) -> (Vec<(String, FileMetadata)>, usize) {
+    match sort_by {
+        "size" => files.sort_by(|a, b| {
+            if desc {
+                b.1.size.cmp(&a.1.size)
+            } else {
+                a.1.size.cmp(&b.1.size)
+            }
+        }),
+        "name" => files.sort_by(|a, b| {
+            if desc {
+                b.1.original_name.cmp(&a.1.original_name)
+            } else {
+                a.1.original_name.cmp(&b.1.original_name)
+            }
+        }),
+        _ => files.sort_by(|a, b| {
+            if desc {
+                b.1.uploaded_at.cmp(&a.1.uploaded_at)
+            } else {
+                a.1.uploaded_at.cmp(&b.1.uploaded_at)
+            }
+        }),
+    }
+
+    let total = files.len();
+    let start = offset.min(total);
+    let end = (offset + limit).min(total);
+    (files[start..end].to_vec(), total)
 }
 
 // ===========================
@@ -173,40 +245,41 @@ impl MetadataStore for MemoryStore {
         token: &str,
         metadata: FileMetadata,
         ttl: StdDuration,
-    ) -> Result<(), String> {
+    ) -> MetadataResult<()> {
         let shard = self.get_shard_for_token(token);
         let mut guard = shard.write();
-        let expires_at = Utc::now() + Duration::from_std(ttl).unwrap();
+        let expires_at = Utc::now()
+            + Duration::from_std(ttl).map_err(|e| MetadataError::Backend(e.to_string()))?;
         guard.insert(token.to_string(), (metadata, expires_at));
         Ok(())
     }
 
-    async fn load(&self, token: &str) -> Result<FileMetadata, String> {
+    async fn load(&self, token: &str) -> MetadataResult<FileMetadata> {
         let shard = self.get_shard_for_token(token);
         let guard = shard.read();
         guard
             .get(token)
             .map(|(metadata, _)| metadata.clone())
-            .ok_or_else(|| "file not found".to_string())
+            .ok_or(MetadataError::NotFound)
     }
 
-    async fn increment_downloads(&self, token: &str) -> Result<i32, String> {
+    async fn increment_downloads(&self, token: &str) -> MetadataResult<i32> {
         let shard = self.get_shard_for_token(token);
         let guard = shard.read();
         guard
             .get(token)
             .map(|(metadata, _)| metadata.increment_download_count())
-            .ok_or_else(|| "file not found".to_string())
+            .ok_or(MetadataError::NotFound)
     }
 
-    async fn remove(&self, token: &str) -> Result<(), String> {
+    async fn remove(&self, token: &str) -> MetadataResult<()> {
         let shard = self.get_shard_for_token(token);
         let mut guard = shard.write();
         guard.remove(token);
         Ok(())
     }
 
-    async fn list_expired(&self, limit: usize) -> Result<(Vec<String>, Vec<FileMetadata>), String> {
+    async fn list_expired(&self, limit: usize) -> MetadataResult<(Vec<String>, Vec<FileMetadata>)> {
         let mut tokens = Vec::new();
         let mut metadata = Vec::new();
         let now = Utc::now();
@@ -233,7 +306,7 @@ impl MetadataStore for MemoryStore {
         limit: usize,
         sort_by: &str,
         desc: bool,
-    ) -> Result<(Vec<(String, FileMetadata)>, usize), String> {
+    ) -> MetadataResult<(Vec<(String, FileMetadata)>, usize)> {
         let mut all_files = Vec::new();
         let now = Utc::now();
 
@@ -247,44 +320,8 @@ impl MetadataStore for MemoryStore {
             }
         }
 
-        // Sort files
-        match sort_by {
-            "size" => {
-                all_files.sort_by(|a, b| {
-                    if desc {
-                        b.1.size.cmp(&a.1.size)
-                    } else {
-                        a.1.size.cmp(&b.1.size)
-                    }
-                });
-            }
-            "name" => {
-                all_files.sort_by(|a, b| {
-                    if desc {
-                        b.1.original_name.cmp(&a.1.original_name)
-                    } else {
-                        a.1.original_name.cmp(&b.1.original_name)
-                    }
-                });
-            }
-            _ => {
-                // Default: sort by uploaded_at
-                all_files.sort_by(|a, b| {
-                    if desc {
-                        b.1.uploaded_at.cmp(&a.1.uploaded_at)
-                    } else {
-                        a.1.uploaded_at.cmp(&b.1.uploaded_at)
-                    }
-                });
-            }
-        }
-
-        let total = all_files.len();
-
-        // Apply pagination
-        let start = offset.min(total);
-        let end = (offset + limit).min(total);
-        let paginated = all_files[start..end].to_vec();
+        let (paginated, total) =
+            sort_and_paginate_files(&mut all_files, offset, limit, sort_by, desc);
 
         Ok((paginated, total))
     }
@@ -300,20 +337,20 @@ struct RedisStore {
 }
 
 impl RedisStore {
-    async fn new(addr: &str, db: i64) -> Result<Self, String> {
+    async fn new(addr: &str, db: i64) -> MetadataResult<Self> {
         let client = Client::open(format!("redis://{}/{}", addr, db))
-            .map_err(|e| format!("Failed to create Redis client: {}", e))?;
+            .map_err(|e| MetadataError::Backend(format!("Failed to create Redis client: {e}")))?;
 
         let conn_manager = ConnectionManager::new(client)
             .await
-            .map_err(|e| format!("Redis connection failed: {}", e))?;
+            .map_err(|e| MetadataError::Backend(format!("Redis connection failed: {e}")))?;
 
         // Test connection
         let mut conn = conn_manager.clone();
         redis::cmd("PING")
             .query_async::<String>(&mut conn)
             .await
-            .map_err(|e| format!("Redis ping failed: {}", e))?;
+            .map_err(|e| MetadataError::Backend(format!("Redis ping failed: {e}")))?;
 
         info!("Redis connection established");
         let increment_script = Script::new(
@@ -358,12 +395,12 @@ impl MetadataStore for RedisStore {
         token: &str,
         metadata: FileMetadata,
         ttl: StdDuration,
-    ) -> Result<(), String> {
+    ) -> MetadataResult<()> {
         let mut conn = self.conn_manager.clone();
 
         let serializable = SerializableMetadata::from(&metadata);
         let data = serde_json::to_string(&serializable)
-            .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+            .map_err(|e| MetadataError::Serialization(e.to_string()))?;
 
         let key = self.metadata_key(token);
         let ttl_secs = ttl.as_secs() as u64;
@@ -374,30 +411,30 @@ impl MetadataStore for RedisStore {
             .zadd(Self::EXPIRY_SET_KEY, token, metadata.expires_at.timestamp())
             .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| format!("Failed to save to Redis: {}", e))?;
+            .map_err(MetadataError::from)?;
 
         Ok(())
     }
 
-    async fn load(&self, token: &str) -> Result<FileMetadata, String> {
+    async fn load(&self, token: &str) -> MetadataResult<FileMetadata> {
         let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
 
         let data: String = conn.get(&key).await.map_err(|e| {
             if e.kind() == redis::ErrorKind::TypeError {
-                "file not found".to_string()
+                MetadataError::NotFound
             } else {
-                format!("Failed to get metadata: {}", e)
+                MetadataError::from(e)
             }
         })?;
 
         let serializable: SerializableMetadata = serde_json::from_str(&data)
-            .map_err(|e| format!("Failed to deserialize metadata: {}", e))?;
+            .map_err(|e| MetadataError::Deserialization(e.to_string()))?;
 
         Ok(serializable.into())
     }
 
-    async fn increment_downloads(&self, token: &str) -> Result<i32, String> {
+    async fn increment_downloads(&self, token: &str) -> MetadataResult<i32> {
         let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
 
@@ -406,16 +443,16 @@ impl MetadataStore for RedisStore {
             .key(&key)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| format!("Failed to increment downloads: {}", e))?;
+            .map_err(MetadataError::from)?;
 
         if new_count < 0 {
-            Err("file not found".to_string())
+            Err(MetadataError::NotFound)
         } else {
             Ok(new_count as i32)
         }
     }
 
-    async fn remove(&self, token: &str) -> Result<(), String> {
+    async fn remove(&self, token: &str) -> MetadataResult<()> {
         let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
 
@@ -425,19 +462,19 @@ impl MetadataStore for RedisStore {
             .zrem(Self::EXPIRY_SET_KEY, token)
             .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| format!("Failed to remove from Redis: {}", e))?;
+            .map_err(MetadataError::from)?;
 
         Ok(())
     }
 
-    async fn list_expired(&self, limit: usize) -> Result<(Vec<String>, Vec<FileMetadata>), String> {
+    async fn list_expired(&self, limit: usize) -> MetadataResult<(Vec<String>, Vec<FileMetadata>)> {
         let mut conn = self.conn_manager.clone();
         let now = Utc::now().timestamp();
 
         let tokens: Vec<String> = conn
             .zrangebyscore_limit(Self::EXPIRY_SET_KEY, 0, now, 0, limit as isize)
             .await
-            .map_err(|e| format!("Failed to get expired tokens: {}", e))?;
+            .map_err(MetadataError::from)?;
 
         if tokens.is_empty() {
             return Ok((vec![], vec![]));
@@ -451,7 +488,7 @@ impl MetadataStore for RedisStore {
         let results: Vec<Option<String>> = pipe
             .query_async(&mut conn)
             .await
-            .map_err(|e| format!("Failed to fetch metadata: {}", e))?;
+            .map_err(MetadataError::from)?;
 
         let mut valid_tokens = Vec::new();
         let mut metadata_list = Vec::new();
@@ -474,7 +511,7 @@ impl MetadataStore for RedisStore {
         limit: usize,
         sort_by: &str,
         desc: bool,
-    ) -> Result<(Vec<(String, FileMetadata)>, usize), String> {
+    ) -> MetadataResult<(Vec<(String, FileMetadata)>, usize)> {
         let mut conn = self.conn_manager.clone();
         let pattern = self.metadata_key("*");
 
@@ -491,7 +528,7 @@ impl MetadataStore for RedisStore {
                 .arg(1000)
                 .query_async(&mut conn)
                 .await
-                .map_err(|e| format!("Failed to scan keys: {}", e))?;
+                .map_err(MetadataError::from)?;
 
             all_keys.extend(keys);
             cursor = next_cursor;
@@ -514,7 +551,7 @@ impl MetadataStore for RedisStore {
         let results: Vec<Option<String>> = pipe
             .query_async(&mut conn)
             .await
-            .map_err(|e| format!("Failed to fetch metadata: {}", e))?;
+            .map_err(MetadataError::from)?;
 
         let mut all_files = Vec::new();
         let now = Utc::now();
@@ -531,44 +568,8 @@ impl MetadataStore for RedisStore {
             }
         }
 
-        // Sort files
-        match sort_by {
-            "size" => {
-                all_files.sort_by(|a, b| {
-                    if desc {
-                        b.1.size.cmp(&a.1.size)
-                    } else {
-                        a.1.size.cmp(&b.1.size)
-                    }
-                });
-            }
-            "name" => {
-                all_files.sort_by(|a, b| {
-                    if desc {
-                        b.1.original_name.cmp(&a.1.original_name)
-                    } else {
-                        a.1.original_name.cmp(&b.1.original_name)
-                    }
-                });
-            }
-            _ => {
-                // Default: sort by uploaded_at
-                all_files.sort_by(|a, b| {
-                    if desc {
-                        b.1.uploaded_at.cmp(&a.1.uploaded_at)
-                    } else {
-                        a.1.uploaded_at.cmp(&b.1.uploaded_at)
-                    }
-                });
-            }
-        }
-
-        let total = all_files.len();
-
-        // Apply pagination
-        let start = offset.min(total);
-        let end = (offset + limit).min(total);
-        let paginated = all_files[start..end].to_vec();
+        let (paginated, total) =
+            sort_and_paginate_files(&mut all_files, offset, limit, sort_by, desc);
 
         Ok((paginated, total))
     }
@@ -681,7 +682,7 @@ impl From<std::io::Error> for SaveFileError {
 }
 
 impl FileServer {
-    async fn new(config: ServerConfig) -> Result<Self, String> {
+    async fn new(config: ServerConfig) -> MetadataResult<Self> {
         let store: Arc<dyn MetadataStore> = if let Some(redis_addr) = &config.redis_addr {
             let redis_store = RedisStore::new(redis_addr, config.redis_db).await?;
             info!("Using Redis storage backend at {}", redis_addr);
@@ -702,11 +703,6 @@ impl FileServer {
             .await
             .map_err(|e| format!("Failed to create upload directory: {}", e))?;
 
-        // Subdirectories will be created on-demand when saving files
-        debug!(
-            "Upload directory initialized at: {}",
-            self.config.upload_dir
-        );
         Ok(())
     }
 
@@ -798,7 +794,7 @@ impl FileServer {
         let token = if filename.len() >= 16 {
             &filename[..16]
         } else {
-            debug!("Found unrecognized file: {:?}", path);
+            info!("Found unrecognized file: {:?}", path);
             return Ok((false, 0));
         };
 
@@ -807,7 +803,7 @@ impl FileServer {
                 let now = Utc::now();
 
                 if now > metadata.expires_at {
-                    debug!(
+                    info!(
                         "Found expired file: {:?} (expired at {})",
                         path, metadata.expires_at
                     );
@@ -815,14 +811,14 @@ impl FileServer {
                     fs::remove_file(&path)
                         .await
                         .map_err(|e| format!("Failed to remove expired file: {}", e))?;
-                    self.store.remove(token).await?;
+                    self.store.remove(token).await.map_err(|e| e.to_string())?;
                     return Ok((true, size));
                 }
 
                 if metadata.download_limit > 0
                     && metadata.get_download_count() >= metadata.download_limit
                 {
-                    debug!(
+                    info!(
                         "Found file exceeding download limit: {:?} ({}/{})",
                         path,
                         metadata.get_download_count(),
@@ -832,14 +828,14 @@ impl FileServer {
                     fs::remove_file(&path)
                         .await
                         .map_err(|e| format!("Failed to remove file: {}", e))?;
-                    self.store.remove(token).await?;
+                    self.store.remove(token).await.map_err(|e| e.to_string())?;
                     return Ok((true, size));
                 }
 
                 Ok((false, 0))
             }
-            Err(_) => {
-                debug!("Found orphaned file (no metadata): {:?}", path);
+            Err(MetadataError::NotFound) => {
+                info!("Found orphaned file (no metadata): {:?}", path);
                 let metadata = fs::metadata(&path)
                     .await
                     .map_err(|e| format!("Failed to get file metadata: {}", e))?;
@@ -848,6 +844,10 @@ impl FileServer {
                     .await
                     .map_err(|e| format!("Failed to remove orphaned file: {}", e))?;
                 Ok((true, size))
+            }
+            Err(err) => {
+                error!("Failed to load metadata for {}: {}", token, err);
+                Err(format!("Failed to load metadata: {}", err))
             }
         }
     }
@@ -1120,11 +1120,14 @@ async fn handle_download(
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    let metadata = server
-        .store
-        .load(token)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let metadata = match server.store.load(token).await {
+        Ok(metadata) => metadata,
+        Err(MetadataError::NotFound) => return Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            error!("Failed to load metadata for {}: {}", token, err);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     if Utc::now() > metadata.expires_at {
         return Err(StatusCode::GONE);
@@ -1152,24 +1155,33 @@ async fn handle_download(
     let token_owned = token.to_string();
     let metadata_clone = metadata.clone();
     tokio::spawn(async move {
-        if let Ok(new_count) = server_clone.store.increment_downloads(&token_owned).await {
-            info!(
-                "Download: {} -> {} (count: {}/{})",
-                metadata_clone.original_name,
-                token_owned,
-                new_count,
-                if metadata_clone.download_limit > 0 {
-                    metadata_clone.download_limit.to_string()
-                } else {
-                    "unlimited".to_string()
-                }
-            );
+        match server_clone.store.increment_downloads(&token_owned).await {
+            Ok(new_count) => {
+                info!(
+                    "Download: {} -> {} (count: {}/{})",
+                    metadata_clone.original_name,
+                    token_owned,
+                    new_count,
+                    if metadata_clone.download_limit > 0 {
+                        metadata_clone.download_limit.to_string()
+                    } else {
+                        "unlimited".to_string()
+                    }
+                );
 
-            // Remove file if download limit reached
-            if metadata_clone.download_limit > 0 && new_count >= metadata_clone.download_limit {
-                server_clone
-                    .remove_file(&token_owned, &metadata_clone)
-                    .await;
+                // Remove file if download limit reached
+                if metadata_clone.download_limit > 0 && new_count >= metadata_clone.download_limit {
+                    server_clone
+                        .remove_file(&token_owned, &metadata_clone)
+                        .await;
+                }
+            }
+            Err(MetadataError::NotFound) => {}
+            Err(err) => {
+                error!(
+                    "Failed to increment download count for {}: {}",
+                    token_owned, err
+                );
             }
         }
     });
