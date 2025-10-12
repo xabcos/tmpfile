@@ -6,8 +6,9 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use bytes::BytesMut;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::{Rng, distributions::Uniform, thread_rng};
 use redis::{AsyncCommands, Client, RedisError, Script, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
@@ -15,10 +16,7 @@ use std::{
     collections::HashMap,
     env, fmt,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicI32, Ordering},
-    },
+    sync::{Arc, LazyLock},
     time::Duration as StdDuration,
 };
 use tokio::{
@@ -43,12 +41,18 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 256 * 1024 * 1024; // 256MB
 const DEFAULT_FILE_EXPIRATION: i64 = 36 * 3600; // 36 hours in seconds
 const DEFAULT_MAX_DOWNLOAD_COUNT: i32 = 0; // 0 means unlimited
 
-const MEMORY_SHARD_COUNT: usize = 16;
+const MEMORY_SHARD_COUNT: usize = 64;
 const CLEANUP_BATCH_SIZE: usize = 128;
 const STORAGE_SUBDIR_DEPTH: usize = 2;
 const STARTUP_CLEANUP_CONCURRENCY: usize = 32;
 const MIN_CLEANUP_INTERVAL_SECS: i64 = 60;
 const MAX_CLEANUP_INTERVAL_SECS: i64 = 24 * 3600;
+const UPLOAD_BUFFER_SIZE: usize = 128 * 1024;
+const UPLOAD_BUFFER_POOL_SIZE: usize = 32;
+const UPLOAD_BUFFER_MAX_RETENTION: usize = 256 * 1024;
+
+static UPLOAD_BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> =
+    LazyLock::new(|| Mutex::new(Vec::with_capacity(UPLOAD_BUFFER_POOL_SIZE)));
 
 const TOKEN_CHARSET: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
 const TOKEN_LENGTH: usize = 8;
@@ -66,19 +70,8 @@ struct FileMetadata {
     extension: String,
     uploaded_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    #[serde(skip)]
-    download_count: Arc<AtomicI32>,
+    download_count: i32,
     download_limit: i32,
-}
-
-impl FileMetadata {
-    fn get_download_count(&self) -> i32 {
-        self.download_count.load(Ordering::Relaxed)
-    }
-
-    fn increment_download_count(&self) -> i32 {
-        self.download_count.fetch_add(1, Ordering::Relaxed) + 1
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +209,7 @@ fn sort_and_paginate_files(
 // Memory Storage Implementation
 // ===========================
 
-type MemoryShard = Arc<RwLock<HashMap<String, (FileMetadata, DateTime<Utc>)>>>;
+type MemoryShard = Arc<RwLock<HashMap<String, FileMetadata>>>;
 
 struct MemoryStore {
     shards: Vec<MemoryShard>,
@@ -243,14 +236,15 @@ impl MetadataStore for MemoryStore {
     async fn save(
         &self,
         token: &str,
-        metadata: FileMetadata,
+        mut metadata: FileMetadata,
         ttl: StdDuration,
     ) -> MetadataResult<()> {
         let shard = self.get_shard_for_token(token);
         let mut guard = shard.write();
-        let expires_at = Utc::now()
-            + Duration::from_std(ttl).map_err(|e| MetadataError::Backend(e.to_string()))?;
-        guard.insert(token.to_string(), (metadata, expires_at));
+        let ttl_duration =
+            Duration::from_std(ttl).map_err(|e| MetadataError::Backend(e.to_string()))?;
+        metadata.expires_at = Utc::now() + ttl_duration;
+        guard.insert(token.to_string(), metadata);
         Ok(())
     }
 
@@ -259,17 +253,16 @@ impl MetadataStore for MemoryStore {
         let guard = shard.read();
         guard
             .get(token)
-            .map(|(metadata, _)| metadata.clone())
+            .map(|metadata| metadata.clone())
             .ok_or(MetadataError::NotFound)
     }
 
     async fn increment_downloads(&self, token: &str) -> MetadataResult<i32> {
         let shard = self.get_shard_for_token(token);
-        let guard = shard.read();
-        guard
-            .get(token)
-            .map(|(metadata, _)| metadata.increment_download_count())
-            .ok_or(MetadataError::NotFound)
+        let mut guard = shard.write();
+        let metadata = guard.get_mut(token).ok_or(MetadataError::NotFound)?;
+        metadata.download_count += 1;
+        Ok(metadata.download_count)
     }
 
     async fn remove(&self, token: &str) -> MetadataResult<()> {
@@ -286,8 +279,8 @@ impl MetadataStore for MemoryStore {
 
         for shard in &self.shards {
             let guard = shard.read();
-            for (token, (meta, expires_at)) in guard.iter() {
-                if now > *expires_at || now > meta.expires_at {
+            for (token, meta) in guard.iter() {
+                if now > meta.expires_at {
                     tokens.push(token.clone());
                     metadata.push(meta.clone());
                     if tokens.len() >= limit {
@@ -313,7 +306,7 @@ impl MetadataStore for MemoryStore {
         // Collect all non-expired files
         for shard in &self.shards {
             let guard = shard.read();
-            for (token, (meta, _)) in guard.iter() {
+            for (token, meta) in guard.iter() {
                 if now < meta.expires_at {
                     all_files.push((token.clone(), meta.clone()));
                 }
@@ -597,7 +590,7 @@ impl From<&FileMetadata> for SerializableMetadata {
             extension: meta.extension.clone(),
             uploaded_at: meta.uploaded_at,
             expires_at: meta.expires_at,
-            download_count: meta.get_download_count(),
+            download_count: meta.download_count,
             download_limit: meta.download_limit,
         }
     }
@@ -612,7 +605,7 @@ impl From<SerializableMetadata> for FileMetadata {
             extension: s.extension,
             uploaded_at: s.uploaded_at,
             expires_at: s.expires_at,
-            download_count: Arc::new(AtomicI32::new(s.download_count)),
+            download_count: s.download_count,
             download_limit: s.download_limit,
         }
     }
@@ -656,6 +649,61 @@ struct ServerConfig {
     api_key: Option<String>,
     redis_addr: Option<String>,
     redis_db: i64,
+}
+
+struct UploadBuffer {
+    buf: Option<BytesMut>,
+}
+
+impl UploadBuffer {
+    fn new() -> Self {
+        let buffer = {
+            let mut pool = UPLOAD_BUFFER_POOL.lock();
+            pool.pop()
+        }
+        .unwrap_or_else(|| BytesMut::with_capacity(UPLOAD_BUFFER_SIZE));
+
+        Self { buf: Some(buffer) }
+    }
+
+    fn len(&self) -> usize {
+        self.buf.as_ref().map(|b| b.len()).unwrap_or(0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.buf.as_ref().map(|b| b.as_ref()).unwrap_or_else(|| &[])
+    }
+
+    fn clear(&mut self) {
+        if let Some(buf) = self.buf.as_mut() {
+            buf.clear();
+        }
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        if let Some(buf) = self.buf.as_mut() {
+            buf.extend_from_slice(data);
+        }
+    }
+}
+
+impl Drop for UploadBuffer {
+    fn drop(&mut self) {
+        if let Some(mut buf) = self.buf.take() {
+            if buf.capacity() <= UPLOAD_BUFFER_MAX_RETENTION {
+                buf.clear();
+                let mut pool = UPLOAD_BUFFER_POOL.lock();
+                if pool.len() < UPLOAD_BUFFER_POOL_SIZE {
+                    pool.push(buf);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 // ===========================
@@ -815,14 +863,11 @@ impl FileServer {
                     return Ok((true, size));
                 }
 
-                if metadata.download_limit > 0
-                    && metadata.get_download_count() >= metadata.download_limit
+                if metadata.download_limit > 0 && metadata.download_count >= metadata.download_limit
                 {
                     info!(
                         "Found file exceeding download limit: {:?} ({}/{})",
-                        path,
-                        metadata.get_download_count(),
-                        metadata.download_limit
+                        path, metadata.download_count, metadata.download_limit
                     );
                     let size = metadata.size;
                     fs::remove_file(&path)
@@ -881,6 +926,7 @@ impl FileServer {
 
         let mut file = File::create(&full_path).await?;
         let mut total_size: u64 = 0;
+        let mut buffer = UploadBuffer::new();
 
         loop {
             let maybe_chunk = field
@@ -891,9 +937,10 @@ impl FileServer {
             let Some(chunk) = maybe_chunk else {
                 break;
             };
+            let chunk_bytes = chunk.as_ref();
 
             total_size = total_size
-                .checked_add(chunk.len() as u64)
+                .checked_add(chunk_bytes.len() as u64)
                 .ok_or_else(|| SaveFileError::Stream("file size overflow".to_string()))?;
 
             if total_size > self.config.max_file_size {
@@ -910,7 +957,25 @@ impl FileServer {
                 return Err(SaveFileError::TooLarge);
             }
 
-            file.write_all(&chunk).await?;
+            if chunk_bytes.len() >= UPLOAD_BUFFER_SIZE {
+                if !buffer.is_empty() {
+                    file.write_all(buffer.as_slice()).await?;
+                    buffer.clear();
+                }
+                file.write_all(chunk_bytes).await?;
+                continue;
+            }
+
+            buffer.extend_from_slice(chunk_bytes);
+
+            if buffer.len() >= UPLOAD_BUFFER_SIZE {
+                file.write_all(buffer.as_slice()).await?;
+                buffer.clear();
+            }
+        }
+
+        if !buffer.is_empty() {
+            file.write_all(buffer.as_slice()).await?;
         }
 
         let now = Utc::now();
@@ -926,7 +991,7 @@ impl FileServer {
             extension: extension_with_dot,
             uploaded_at: now,
             expires_at: now + self.config.file_expiration,
-            download_count: Arc::new(AtomicI32::new(0)),
+            download_count: 0,
             download_limit: self.config.max_download_count,
         })
     }
@@ -1133,7 +1198,7 @@ async fn handle_download(
         return Err(StatusCode::GONE);
     }
 
-    if metadata.download_limit > 0 && metadata.get_download_count() >= metadata.download_limit {
+    if metadata.download_limit > 0 && metadata.download_count >= metadata.download_limit {
         let server_clone = server.clone();
         let token_owned = token.to_string();
         let metadata_clone = metadata.clone();
@@ -1295,7 +1360,7 @@ async fn handle_list_files(
             size: metadata.size,
             uploaded_at: metadata.uploaded_at,
             expires_at: metadata.expires_at,
-            download_count: metadata.get_download_count(),
+            download_count: metadata.download_count,
             token,
         })
         .collect();
