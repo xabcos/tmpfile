@@ -1,15 +1,15 @@
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{Multipart, Path, State},
+    body::Body,
+    extract::{Multipart, Path, State, multipart::Field},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
 };
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
-use rand::{Rng, thread_rng};
-use redis::{AsyncCommands, Client, aio::ConnectionManager};
+use rand::{Rng, distributions::Uniform, thread_rng};
+use redis::{AsyncCommands, Client, Script, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -24,8 +24,11 @@ use std::{
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
+    sync::Semaphore,
+    task::JoinSet,
     time::interval,
 };
+use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
@@ -43,6 +46,9 @@ const DEFAULT_MAX_DOWNLOAD_COUNT: i32 = 0; // 0 means unlimited
 const MEMORY_SHARD_COUNT: usize = 16;
 const CLEANUP_BATCH_SIZE: usize = 128;
 const STORAGE_SUBDIR_DEPTH: usize = 2;
+const STARTUP_CLEANUP_CONCURRENCY: usize = 32;
+const MIN_CLEANUP_INTERVAL_SECS: i64 = 60;
+const MAX_CLEANUP_INTERVAL_SECS: i64 = 24 * 3600;
 
 const TOKEN_CHARSET: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
 const TOKEN_LENGTH: usize = 8;
@@ -93,6 +99,26 @@ struct UploadResponse {
 // Storage Trait
 // ===========================
 
+#[derive(Debug, Serialize)]
+struct FileItem {
+    token: String,
+    filename: String,
+    size: i64,
+    uploaded_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    download_count: i32,
+    download_link: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListFilesResponse {
+    files: Vec<FileItem>,
+    total: usize,
+    page: usize,
+    size: usize,
+    total_pages: usize,
+}
+
 #[async_trait::async_trait]
 trait MetadataStore: Send + Sync {
     async fn save(
@@ -105,6 +131,13 @@ trait MetadataStore: Send + Sync {
     async fn increment_downloads(&self, token: &str) -> Result<i32, String>;
     async fn remove(&self, token: &str) -> Result<(), String>;
     async fn list_expired(&self, limit: usize) -> Result<(Vec<String>, Vec<FileMetadata>), String>;
+    async fn list_files(
+        &self,
+        offset: usize,
+        limit: usize,
+        sort_by: &str,
+        desc: bool,
+    ) -> Result<(Vec<(String, FileMetadata)>, usize), String>;
 }
 
 // ===========================
@@ -193,6 +226,68 @@ impl MetadataStore for MemoryStore {
 
         Ok((tokens, metadata))
     }
+
+    async fn list_files(
+        &self,
+        offset: usize,
+        limit: usize,
+        sort_by: &str,
+        desc: bool,
+    ) -> Result<(Vec<(String, FileMetadata)>, usize), String> {
+        let mut all_files = Vec::new();
+        let now = Utc::now();
+
+        // Collect all non-expired files
+        for shard in &self.shards {
+            let guard = shard.read();
+            for (token, (meta, _)) in guard.iter() {
+                if now < meta.expires_at {
+                    all_files.push((token.clone(), meta.clone()));
+                }
+            }
+        }
+
+        // Sort files
+        match sort_by {
+            "size" => {
+                all_files.sort_by(|a, b| {
+                    if desc {
+                        b.1.size.cmp(&a.1.size)
+                    } else {
+                        a.1.size.cmp(&b.1.size)
+                    }
+                });
+            }
+            "name" => {
+                all_files.sort_by(|a, b| {
+                    if desc {
+                        b.1.original_name.cmp(&a.1.original_name)
+                    } else {
+                        a.1.original_name.cmp(&b.1.original_name)
+                    }
+                });
+            }
+            _ => {
+                // Default: sort by uploaded_at
+                all_files.sort_by(|a, b| {
+                    if desc {
+                        b.1.uploaded_at.cmp(&a.1.uploaded_at)
+                    } else {
+                        a.1.uploaded_at.cmp(&b.1.uploaded_at)
+                    }
+                });
+            }
+        }
+
+        let total = all_files.len();
+
+        // Apply pagination
+        let start = offset.min(total);
+        let end = (offset + limit).min(total);
+        let paginated = all_files[start..end].to_vec();
+
+        Ok((paginated, total))
+    }
 }
 
 // ===========================
@@ -201,6 +296,7 @@ impl MetadataStore for MemoryStore {
 
 struct RedisStore {
     conn_manager: ConnectionManager,
+    increment_script: Script,
 }
 
 impl RedisStore {
@@ -220,7 +316,32 @@ impl RedisStore {
             .map_err(|e| format!("Redis ping failed: {}", e))?;
 
         info!("Redis connection established");
-        Ok(Self { conn_manager })
+        let increment_script = Script::new(
+            r#"
+local key = KEYS[1]
+local data = redis.call('GET', key)
+if not data then
+  return -1
+end
+
+local metadata = cjson.decode(data)
+metadata.download_count = metadata.download_count + 1
+
+local ttl = redis.call('TTL', key)
+if ttl > 0 then
+  redis.call('SET', key, cjson.encode(metadata), 'EX', ttl)
+else
+  redis.call('SET', key, cjson.encode(metadata))
+end
+
+return metadata.download_count
+"#,
+        );
+
+        Ok(Self {
+            conn_manager,
+            increment_script,
+        })
     }
 
     fn metadata_key(&self, token: &str) -> String {
@@ -280,31 +401,18 @@ impl MetadataStore for RedisStore {
         let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
 
-        let data: String = conn
-            .get(&key)
+        let new_count: i64 = self
+            .increment_script
+            .key(&key)
+            .invoke_async(&mut conn)
             .await
-            .map_err(|_| "file not found".to_string())?;
+            .map_err(|e| format!("Failed to increment downloads: {}", e))?;
 
-        let mut metadata: SerializableMetadata = serde_json::from_str(&data)
-            .map_err(|e| format!("Failed to deserialize metadata: {}", e))?;
-
-        metadata.download_count += 1;
-        let new_count = metadata.download_count;
-
-        let ttl: i64 = conn
-            .ttl(&key)
-            .await
-            .map_err(|e| format!("Failed to get TTL: {}", e))?;
-
-        if ttl > 0 {
-            let new_data = serde_json::to_string(&metadata)
-                .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
-            conn.set_ex::<_, _, ()>(&key, new_data, ttl as u64)
-                .await
-                .map_err(|e| format!("Failed to update metadata: {}", e))?;
+        if new_count < 0 {
+            Err("file not found".to_string())
+        } else {
+            Ok(new_count as i32)
         }
-
-        Ok(new_count)
     }
 
     async fn remove(&self, token: &str) -> Result<(), String> {
@@ -335,12 +443,21 @@ impl MetadataStore for RedisStore {
             return Ok((vec![], vec![]));
         }
 
+        let mut pipe = redis::pipe();
+        for token in &tokens {
+            pipe.get(self.metadata_key(token));
+        }
+
+        let results: Vec<Option<String>> = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to fetch metadata: {}", e))?;
+
         let mut valid_tokens = Vec::new();
         let mut metadata_list = Vec::new();
 
-        for token in tokens {
-            let key = self.metadata_key(&token);
-            if let Ok(data) = conn.get::<_, String>(&key).await {
+        for (token, data) in tokens.into_iter().zip(results.into_iter()) {
+            if let Some(data) = data {
                 if let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(&data) {
                     valid_tokens.push(token);
                     metadata_list.push(serializable.into());
@@ -349,6 +466,111 @@ impl MetadataStore for RedisStore {
         }
 
         Ok((valid_tokens, metadata_list))
+    }
+
+    async fn list_files(
+        &self,
+        offset: usize,
+        limit: usize,
+        sort_by: &str,
+        desc: bool,
+    ) -> Result<(Vec<(String, FileMetadata)>, usize), String> {
+        let mut conn = self.conn_manager.clone();
+        let pattern = self.metadata_key("*");
+
+        let mut all_keys = Vec::new();
+        let mut cursor = 0u64;
+
+        // Use SCAN to get all keys
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| format!("Failed to scan keys: {}", e))?;
+
+            all_keys.extend(keys);
+            cursor = next_cursor;
+
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        if all_keys.is_empty() {
+            return Ok((vec![], 0));
+        }
+
+        // Fetch all metadata in parallel using pipeline
+        let mut pipe = redis::pipe();
+        for key in &all_keys {
+            pipe.get(key);
+        }
+
+        let results: Vec<Option<String>> = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to fetch metadata: {}", e))?;
+
+        let mut all_files = Vec::new();
+        let now = Utc::now();
+
+        for (key, data) in all_keys.iter().zip(results.iter()) {
+            if let Some(data) = data {
+                if let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(data) {
+                    let metadata: FileMetadata = serializable.into();
+                    if now < metadata.expires_at {
+                        let token = key.strip_prefix("file:meta:").unwrap_or("").to_string();
+                        all_files.push((token, metadata));
+                    }
+                }
+            }
+        }
+
+        // Sort files
+        match sort_by {
+            "size" => {
+                all_files.sort_by(|a, b| {
+                    if desc {
+                        b.1.size.cmp(&a.1.size)
+                    } else {
+                        a.1.size.cmp(&b.1.size)
+                    }
+                });
+            }
+            "name" => {
+                all_files.sort_by(|a, b| {
+                    if desc {
+                        b.1.original_name.cmp(&a.1.original_name)
+                    } else {
+                        a.1.original_name.cmp(&b.1.original_name)
+                    }
+                });
+            }
+            _ => {
+                // Default: sort by uploaded_at
+                all_files.sort_by(|a, b| {
+                    if desc {
+                        b.1.uploaded_at.cmp(&a.1.uploaded_at)
+                    } else {
+                        a.1.uploaded_at.cmp(&b.1.uploaded_at)
+                    }
+                });
+            }
+        }
+
+        let total = all_files.len();
+
+        // Apply pagination
+        let start = offset.min(total);
+        let end = (offset + limit).min(total);
+        let paginated = all_files[start..end].to_vec();
+
+        Ok((paginated, total))
     }
 }
 
@@ -404,14 +626,17 @@ struct TokenGenerator;
 impl TokenGenerator {
     fn generate() -> String {
         let mut rng = thread_rng();
-        let charset: Vec<char> = TOKEN_CHARSET.chars().collect();
+        let charset = TOKEN_CHARSET.as_bytes();
+        let distribution = Uniform::from(0..charset.len());
+        let mut token = String::with_capacity(TOKEN_LENGTH + TOKEN_TIME_FORMAT.len());
 
-        let random_part: String = (0..TOKEN_LENGTH)
-            .map(|_| charset[rng.gen_range(0..charset.len())])
-            .collect();
+        for _ in 0..TOKEN_LENGTH {
+            let idx = rng.sample(distribution);
+            token.push(char::from(charset[idx]));
+        }
 
-        let time_part = Utc::now().format(TOKEN_TIME_FORMAT).to_string();
-        format!("{}{}", random_part, time_part)
+        token.push_str(&Utc::now().format(TOKEN_TIME_FORMAT).to_string());
+        token
     }
 }
 
@@ -440,6 +665,19 @@ struct ServerConfig {
 struct FileServer {
     config: Arc<ServerConfig>,
     store: Arc<dyn MetadataStore>,
+}
+
+#[derive(Debug)]
+enum SaveFileError {
+    TooLarge,
+    Io(std::io::Error),
+    Stream(String),
+}
+
+impl From<std::io::Error> for SaveFileError {
+    fn from(value: std::io::Error) -> Self {
+        SaveFileError::Io(value)
+    }
 }
 
 impl FileServer {
@@ -479,6 +717,9 @@ impl FileServer {
         let mut total_size = 0i64;
         let mut error_count = 0;
 
+        let semaphore = Arc::new(Semaphore::new(STARTUP_CLEANUP_CONCURRENCY));
+        let mut join_set = JoinSet::new();
+
         let mut entries = fs::read_dir(&self.config.upload_dir)
             .await
             .map_err(|e| format!("Failed to read upload directory: {}", e))?;
@@ -501,19 +742,37 @@ impl FileServer {
                 {
                     let file_path = file_entry.path();
                     if file_path.is_file() {
-                        match self.check_and_clean_file(&file_path).await {
-                            Ok((cleaned, size)) => {
-                                if cleaned {
-                                    cleaned_count += 1;
-                                    total_size += size;
-                                }
-                            }
-                            Err(e) => {
-                                error_count += 1;
-                                error!("Error cleaning file {:?}: {}", file_path, e);
-                            }
-                        }
+                        let permit = semaphore
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| format!("Cleanup semaphore closed: {}", e))?;
+                        let server = self.clone();
+                        join_set.spawn(async move {
+                            let _permit = permit;
+                            let result = server.check_and_clean_file(file_path).await;
+                            result
+                        });
                     }
+                }
+            }
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok((cleaned, size))) => {
+                    if cleaned {
+                        cleaned_count += 1;
+                        total_size += size;
+                    }
+                }
+                Ok(Err(e)) => {
+                    error_count += 1;
+                    error!("Error cleaning file during startup cleanup: {}", e);
+                }
+                Err(e) => {
+                    error_count += 1;
+                    error!("Startup cleanup task panicked: {}", e);
                 }
             }
         }
@@ -530,7 +789,7 @@ impl FileServer {
         Ok(())
     }
 
-    async fn check_and_clean_file(&self, path: &PathBuf) -> Result<(bool, i64), String> {
+    async fn check_and_clean_file(&self, path: PathBuf) -> Result<(bool, i64), String> {
         let filename = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -553,7 +812,7 @@ impl FileServer {
                         path, metadata.expires_at
                     );
                     let size = metadata.size;
-                    fs::remove_file(path)
+                    fs::remove_file(&path)
                         .await
                         .map_err(|e| format!("Failed to remove expired file: {}", e))?;
                     self.store.remove(token).await?;
@@ -570,7 +829,7 @@ impl FileServer {
                         metadata.download_limit
                     );
                     let size = metadata.size;
-                    fs::remove_file(path)
+                    fs::remove_file(&path)
                         .await
                         .map_err(|e| format!("Failed to remove file: {}", e))?;
                     self.store.remove(token).await?;
@@ -581,11 +840,11 @@ impl FileServer {
             }
             Err(_) => {
                 debug!("Found orphaned file (no metadata): {:?}", path);
-                let metadata = fs::metadata(path)
+                let metadata = fs::metadata(&path)
                     .await
                     .map_err(|e| format!("Failed to get file metadata: {}", e))?;
                 let size = metadata.len() as i64;
-                fs::remove_file(path)
+                fs::remove_file(&path)
                     .await
                     .map_err(|e| format!("Failed to remove orphaned file: {}", e))?;
                 Ok((true, size))
@@ -603,39 +862,68 @@ impl FileServer {
     async fn save_file(
         &self,
         token: &str,
-        data: Bytes,
+        mut field: Field<'_>,
         filename: &str,
-    ) -> Result<FileMetadata, String> {
+    ) -> Result<FileMetadata, SaveFileError> {
         let extension = PathBuf::from(filename)
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e))
-            .unwrap_or_default();
+            .map(|ext| ext.to_owned());
 
-        let storage_path = self.get_storage_path(token);
-        let full_path = PathBuf::from(format!("{}{}", storage_path.display(), extension));
-
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("Failed to create directory: {}", e))?;
+        let mut full_path = self.get_storage_path(token);
+        if let Some(ext) = &extension {
+            full_path.set_extension(ext);
         }
 
-        let mut file = File::create(&full_path)
-            .await
-            .map_err(|e| format!("Failed to create file: {}", e))?;
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
 
-        let size = data.len() as i64;
-        file.write_all(&data)
-            .await
-            .map_err(|e| format!("Failed to write file: {}", e))?;
+        let mut file = File::create(&full_path).await?;
+        let mut total_size: u64 = 0;
+
+        loop {
+            let maybe_chunk = field
+                .chunk()
+                .await
+                .map_err(|err| SaveFileError::Stream(err.to_string()))?;
+
+            let Some(chunk) = maybe_chunk else {
+                break;
+            };
+
+            total_size = total_size
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| SaveFileError::Stream("file size overflow".to_string()))?;
+
+            if total_size > self.config.max_file_size {
+                drop(file);
+                if let Err(e) = fs::remove_file(&full_path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        error!(
+                            "Failed to remove oversized temp file {}: {}",
+                            full_path.display(),
+                            e
+                        );
+                    }
+                }
+                return Err(SaveFileError::TooLarge);
+            }
+
+            file.write_all(&chunk).await?;
+        }
 
         let now = Utc::now();
+        let extension_with_dot = extension
+            .as_ref()
+            .map(|ext| format!(".{}", ext))
+            .unwrap_or_default();
+
         Ok(FileMetadata {
             original_name: filename.to_string(),
             storage_path: full_path.to_string_lossy().to_string(),
-            size,
-            extension,
+            size: total_size as i64,
+            extension: extension_with_dot,
             uploaded_at: now,
             expires_at: now + self.config.file_expiration,
             download_count: Arc::new(AtomicI32::new(0)),
@@ -742,20 +1030,21 @@ async fn handle_upload(
                 continue;
             }
 
-            let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
-
-            if data.len() > server.config.max_file_size as usize {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
-            }
-
             let token = TokenGenerator::generate();
-            let metadata = server
-                .save_file(&token, data, &filename)
-                .await
-                .map_err(|e| {
-                    error!("Failed to save file: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+            let metadata = match server.save_file(&token, field, &filename).await {
+                Ok(metadata) => metadata,
+                Err(SaveFileError::TooLarge) => {
+                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                Err(SaveFileError::Stream(e)) => {
+                    warn!("Failed to read upload stream for {}: {}", filename, e);
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                Err(SaveFileError::Io(e)) => {
+                    error!("Failed to save file {}: {}", filename, e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
 
             let ttl = if server.config.redis_addr.is_some() {
                 server.config.file_expiration + server.config.cleanup_interval
@@ -853,39 +1142,39 @@ async fn handle_download(
         return Err(StatusCode::GONE);
     }
 
-    let file_data = fs::read(&metadata.storage_path)
+    // Open file for streaming
+    let file = File::open(&metadata.storage_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    let new_count = server
-        .store
-        .increment_downloads(token)
-        .await
-        .unwrap_or(metadata.get_download_count() + 1);
+    // Asynchronously update download count to avoid blocking the response
+    let server_clone = server.clone();
+    let token_owned = token.to_string();
+    let metadata_clone = metadata.clone();
+    tokio::spawn(async move {
+        if let Ok(new_count) = server_clone.store.increment_downloads(&token_owned).await {
+            info!(
+                "Download: {} -> {} (count: {}/{})",
+                metadata_clone.original_name,
+                token_owned,
+                new_count,
+                if metadata_clone.download_limit > 0 {
+                    metadata_clone.download_limit.to_string()
+                } else {
+                    "unlimited".to_string()
+                }
+            );
 
-    info!(
-        "Download: {} -> {} (count: {}/{})",
-        metadata.original_name,
-        token,
-        new_count,
-        if metadata.download_limit > 0 {
-            metadata.download_limit.to_string()
-        } else {
-            "unlimited".to_string()
+            // Remove file if download limit reached
+            if metadata_clone.download_limit > 0 && new_count >= metadata_clone.download_limit {
+                server_clone
+                    .remove_file(&token_owned, &metadata_clone)
+                    .await;
+            }
         }
-    );
+    });
 
-    if metadata.download_limit > 0 && new_count >= metadata.download_limit {
-        let server_clone = server.clone();
-        let token_owned = token.to_string();
-        let metadata_clone = metadata.clone();
-        tokio::spawn(async move {
-            server_clone
-                .remove_file(&token_owned, &metadata_clone)
-                .await;
-        });
-    }
-
+    // Set response headers
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -906,33 +1195,170 @@ async fn handle_download(
     );
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 
-    Ok((headers, file_data))
+    // Create streaming response
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    Ok((headers, body))
+}
+
+async fn handle_list_files(
+    State(server): State<Arc<FileServer>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    // Validate API key if configured
+    if let Some(api_key) = &server.config.api_key {
+        let auth_header = headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+
+        let provided_key = auth_header.strip_prefix("Bearer ").unwrap_or("");
+        if provided_key != api_key {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    // Parse query parameters
+    let page: usize = params
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+
+    let size: usize = params
+        .get("size")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192)
+        .min(100)
+        .max(1);
+
+    let sort_by = params
+        .get("sort_by")
+        .map(|s| s.as_str())
+        .unwrap_or("uploaded_at");
+
+    let order = params.get("order").map(|o| o.as_str()).unwrap_or("desc");
+
+    let desc = order == "desc";
+
+    // Calculate offset
+    let offset = (page - 1) * size;
+
+    // Get file list
+    let (files, total) = server
+        .store
+        .list_files(offset, size, sort_by, desc)
+        .await
+        .map_err(|e| {
+            error!("Failed to list files: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Build response with download links
+    let scheme = if headers
+        .get("x-forwarded-proto")
+        .map(|v| v == "https")
+        .unwrap_or(false)
+    {
+        "https"
+    } else {
+        "http"
+    };
+
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost");
+
+    let file_items: Vec<FileItem> = files
+        .into_iter()
+        .map(|(token, metadata)| FileItem {
+            download_link: format!(
+                "{}://{}/files/{}{}",
+                scheme, host, token, metadata.extension
+            ),
+            filename: metadata.original_name.clone(),
+            size: metadata.size,
+            uploaded_at: metadata.uploaded_at,
+            expires_at: metadata.expires_at,
+            download_count: metadata.get_download_count(),
+            token,
+        })
+        .collect();
+
+    let total_pages = ((total + size - 1) / size).max(1);
+
+    let response = ListFilesResponse {
+        files: file_items,
+        total,
+        page,
+        size,
+        total_pages,
+    };
+
+    Ok(Json(response))
 }
 
 // ===========================
 // Configuration Helpers
 // ===========================
 
+fn parse_duration_value(value: &str) -> Option<Duration> {
+    value
+        .parse::<i64>()
+        .ok()
+        .map(Duration::seconds)
+        .or_else(|| {
+            if let Some(stripped) = value.strip_suffix('h') {
+                stripped.parse::<i64>().ok().map(Duration::hours)
+            } else if let Some(stripped) = value.strip_suffix('d') {
+                stripped.parse::<i64>().ok().map(Duration::days)
+            } else if let Some(stripped) = value.strip_suffix('m') {
+                stripped.parse::<i64>().ok().map(Duration::minutes)
+            } else {
+                None
+            }
+        })
+}
+
 fn parse_env_duration(key: &str, default: i64) -> Duration {
     env::var(key)
         .ok()
-        .and_then(|v| {
-            v.parse::<i64>().ok().map(Duration::seconds).or_else(|| {
-                if v.ends_with('h') {
-                    v[..v.len() - 1].parse::<i64>().ok().map(Duration::hours)
-                } else if v.ends_with('d') {
-                    v[..v.len() - 1].parse::<i64>().ok().map(Duration::days)
-                } else if v.ends_with('m') {
-                    v[..v.len() - 1].parse::<i64>().ok().map(Duration::minutes)
-                } else {
-                    None
-                }
-            })
-        })
+        .and_then(|v| parse_duration_value(&v))
         .unwrap_or_else(|| {
             info!("Using default {} seconds for {}", default, key);
             Duration::seconds(default)
         })
+}
+
+fn clamp_duration(value: Duration, min: Duration, max: Duration) -> Duration {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+fn resolve_cleanup_interval(file_expiration: Duration) -> Duration {
+    let desired = env::var("CLEANUP_INTERVAL")
+        .ok()
+        .and_then(|v| parse_duration_value(&v))
+        .unwrap_or(file_expiration / 2);
+
+    let min = Duration::seconds(MIN_CLEANUP_INTERVAL_SECS);
+    let max_candidate = Duration::seconds(MAX_CLEANUP_INTERVAL_SECS);
+
+    if file_expiration < min {
+        let upper = std::cmp::max(file_expiration, Duration::seconds(1));
+        return clamp_duration(desired, Duration::seconds(1), upper);
+    }
+
+    let max = std::cmp::min(max_candidate, file_expiration);
+    clamp_duration(desired, min, max)
 }
 
 fn parse_env_int(key: &str, default: i32) -> i32 {
@@ -968,12 +1394,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    let max_file_size = parse_env_u64("MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE);
+    let file_expiration = parse_env_duration("FILE_EXPIRATION", DEFAULT_FILE_EXPIRATION);
+    let cleanup_interval = resolve_cleanup_interval(file_expiration);
+
     let config = ServerConfig {
         listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_string()),
         upload_dir: env::var("UPLOAD_DIR").unwrap_or_else(|_| DEFAULT_UPLOAD_DIR.to_string()),
-        max_file_size: parse_env_u64("MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE),
-        file_expiration: parse_env_duration("FILE_EXPIRATION", DEFAULT_FILE_EXPIRATION),
-        cleanup_interval: parse_env_duration("FILE_EXPIRATION", DEFAULT_FILE_EXPIRATION) / 2,
+        max_file_size,
+        file_expiration,
+        cleanup_interval,
         max_download_count: parse_env_int("MAX_DOWNLOAD_COUNT", DEFAULT_MAX_DOWNLOAD_COUNT),
         api_key: env::var("API_KEY").ok().filter(|s| !s.is_empty()),
         redis_addr: env::var("REDIS_ADDR").ok().filter(|s| !s.is_empty()),
@@ -985,9 +1415,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("File server starting on {}", config.listen_addr);
     info!(
-        "Configuration: MaxFileSize={}MB, FileExpiration={}h, MaxDownloads={}",
+        "Configuration: MaxFileSize={}MB, FileExpiration={}h, CleanupInterval={}m, MaxDownloads={}",
         config.max_file_size / (1024 * 1024),
         config.file_expiration.num_hours(),
+        config.cleanup_interval.num_minutes(),
         if config.max_download_count > 0 {
             config.max_download_count.to_string()
         } else {
@@ -1015,6 +1446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/upload", post(handle_upload))
         .route("/files/{path}", get(handle_download))
+        .route("/list", get(handle_list_files))
         .layer(
             ServiceBuilder::new().layer(RequestBodyLimitLayer::new(config.max_file_size as usize)),
         )

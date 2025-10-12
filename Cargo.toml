@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["limit"] }
 serde = { version = "1", features = ["derive"] }
