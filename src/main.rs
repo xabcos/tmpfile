@@ -169,7 +169,7 @@ trait MetadataStore: Send + Sync {
 }
 
 fn sort_and_paginate_files(
-    files: &mut Vec<(String, FileMetadata)>,
+    files: &mut [(String, FileMetadata)],
     offset: usize,
     limit: usize,
     sort_by: &str,
@@ -253,7 +253,7 @@ impl MetadataStore for MemoryStore {
         let guard = shard.read();
         guard
             .get(token)
-            .map(|metadata| metadata.clone())
+            .cloned()
             .ok_or(MetadataError::NotFound)
     }
 
@@ -396,7 +396,7 @@ impl MetadataStore for RedisStore {
             .map_err(|e| MetadataError::Serialization(e.to_string()))?;
 
         let key = self.metadata_key(token);
-        let ttl_secs = ttl.as_secs() as u64;
+        let ttl_secs = ttl.as_secs();
 
         redis::pipe()
             .atomic()
@@ -487,12 +487,11 @@ impl MetadataStore for RedisStore {
         let mut metadata_list = Vec::new();
 
         for (token, data) in tokens.into_iter().zip(results.into_iter()) {
-            if let Some(data) = data {
-                if let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(&data) {
+            if let Some(data) = data
+                && let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(&data) {
                     valid_tokens.push(token);
                     metadata_list.push(serializable.into());
                 }
-            }
         }
 
         Ok((valid_tokens, metadata_list))
@@ -550,15 +549,14 @@ impl MetadataStore for RedisStore {
         let now = Utc::now();
 
         for (key, data) in all_keys.iter().zip(results.iter()) {
-            if let Some(data) = data {
-                if let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(data) {
+            if let Some(data) = data
+                && let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(data) {
                     let metadata: FileMetadata = serializable.into();
                     if now < metadata.expires_at {
                         let token = key.strip_prefix("file:meta:").unwrap_or("").to_string();
                         all_files.push((token, metadata));
                     }
                 }
-            }
         }
 
         let (paginated, total) =
@@ -693,16 +691,14 @@ impl UploadBuffer {
 
 impl Drop for UploadBuffer {
     fn drop(&mut self) {
-        if let Some(mut buf) = self.buf.take() {
-            if buf.capacity() <= UPLOAD_BUFFER_MAX_RETENTION {
+        if let Some(mut buf) = self.buf.take()
+            && buf.capacity() <= UPLOAD_BUFFER_MAX_RETENTION {
                 buf.clear();
                 let mut pool = UPLOAD_BUFFER_POOL.lock();
                 if pool.len() < UPLOAD_BUFFER_POOL_SIZE {
                     pool.push(buf);
-                    return;
                 }
             }
-        }
     }
 }
 
@@ -794,8 +790,7 @@ impl FileServer {
                         let server = self.clone();
                         join_set.spawn(async move {
                             let _permit = permit;
-                            let result = server.check_and_clean_file(file_path).await;
-                            result
+                            server.check_and_clean_file(file_path).await
                         });
                     }
                 }
@@ -945,15 +940,14 @@ impl FileServer {
 
             if total_size > self.config.max_file_size {
                 drop(file);
-                if let Err(e) = fs::remove_file(&full_path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
+                if let Err(e) = fs::remove_file(&full_path).await
+                    && e.kind() != std::io::ErrorKind::NotFound {
                         error!(
                             "Failed to remove oversized temp file {}: {}",
                             full_path.display(),
                             e
                         );
                     }
-                }
                 return Err(SaveFileError::TooLarge);
             }
 
@@ -997,11 +991,10 @@ impl FileServer {
     }
 
     async fn remove_file(&self, token: &str, metadata: &FileMetadata) {
-        if let Err(e) = fs::remove_file(&metadata.storage_path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
+        if let Err(e) = fs::remove_file(&metadata.storage_path).await
+            && e.kind() != std::io::ErrorKind::NotFound {
                 error!("Failed to remove file {}: {}", metadata.storage_path, e);
             }
-        }
 
         if let Err(e) = self.store.remove(token).await {
             error!("Failed to remove metadata for token {}: {}", token, e);
@@ -1123,7 +1116,7 @@ async fn handle_upload(
                 .await
                 .map_err(|e| {
                     error!("Failed to save metadata: {}", e);
-                    let _ = fs::remove_file(&metadata.storage_path);
+                    drop(fs::remove_file(&metadata.storage_path));
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
@@ -1307,9 +1300,7 @@ async fn handle_list_files(
     let size: usize = params
         .get("size")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8192)
-        .min(100)
-        .max(1);
+        .unwrap_or(8192).clamp(1, 100);
 
     let sort_by = params
         .get("sort_by")
@@ -1365,7 +1356,7 @@ async fn handle_list_files(
         })
         .collect();
 
-    let total_pages = ((total + size - 1) / size).max(1);
+    let total_pages = total.div_ceil(size).max(1);
 
     let response = ListFilesResponse {
         files: file_items,
