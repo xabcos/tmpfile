@@ -9,7 +9,7 @@ use axum::{
 use bytes::BytesMut;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::{Mutex, RwLock};
-use rand::{Rng, distributions::Uniform, thread_rng};
+use rand::Rng;
 use redis::{AsyncCommands, Client, RedisError, Script, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -617,13 +617,12 @@ struct TokenGenerator;
 
 impl TokenGenerator {
     fn generate() -> String {
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let charset = TOKEN_CHARSET.as_bytes();
-        let distribution = Uniform::from(0..charset.len());
         let mut token = String::with_capacity(TOKEN_LENGTH + TOKEN_TIME_FORMAT.len());
 
         for _ in 0..TOKEN_LENGTH {
-            let idx = rng.sample(distribution);
+            let idx = rng.random_range(0..charset.len());
             token.push(char::from(charset[idx]));
         }
 
