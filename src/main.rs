@@ -6,22 +6,17 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use bytes::BytesMut;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rand::Rng;
 use redis::{AsyncCommands, Client, RedisError, Script, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    env, fmt,
-    path::PathBuf,
-    sync::{Arc, LazyLock},
-    time::Duration as StdDuration,
+    collections::HashMap, env, fmt, path::PathBuf, sync::Arc, time::Duration as StdDuration,
 };
 use tokio::{
     fs::{self, File},
-    io::AsyncWriteExt,
+    io::{AsyncWriteExt, BufWriter},
     sync::Semaphore,
     task::JoinSet,
     time::interval,
@@ -47,12 +42,7 @@ const STORAGE_SUBDIR_DEPTH: usize = 2;
 const STARTUP_CLEANUP_CONCURRENCY: usize = 32;
 const MIN_CLEANUP_INTERVAL_SECS: i64 = 60;
 const MAX_CLEANUP_INTERVAL_SECS: i64 = 24 * 3600;
-const UPLOAD_BUFFER_SIZE: usize = 128 * 1024;
-const UPLOAD_BUFFER_POOL_SIZE: usize = 32;
-const UPLOAD_BUFFER_MAX_RETENTION: usize = 256 * 1024;
-
-static UPLOAD_BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> =
-    LazyLock::new(|| Mutex::new(Vec::with_capacity(UPLOAD_BUFFER_POOL_SIZE)));
+const FILE_WRITE_BUFFER_SIZE: usize = 128 * 1024;
 
 const TOKEN_CHARSET: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
 const TOKEN_LENGTH: usize = 8;
@@ -251,10 +241,7 @@ impl MetadataStore for MemoryStore {
     async fn load(&self, token: &str) -> MetadataResult<FileMetadata> {
         let shard = self.get_shard_for_token(token);
         let guard = shard.read();
-        guard
-            .get(token)
-            .cloned()
-            .ok_or(MetadataError::NotFound)
+        guard.get(token).cloned().ok_or(MetadataError::NotFound)
     }
 
     async fn increment_downloads(&self, token: &str) -> MetadataResult<i32> {
@@ -303,7 +290,6 @@ impl MetadataStore for MemoryStore {
         let mut all_files = Vec::new();
         let now = Utc::now();
 
-        // Collect all non-expired files
         for shard in &self.shards {
             let guard = shard.read();
             for (token, meta) in guard.iter() {
@@ -488,10 +474,11 @@ impl MetadataStore for RedisStore {
 
         for (token, data) in tokens.into_iter().zip(results.into_iter()) {
             if let Some(data) = data
-                && let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(&data) {
-                    valid_tokens.push(token);
-                    metadata_list.push(serializable.into());
-                }
+                && let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(&data)
+            {
+                valid_tokens.push(token);
+                metadata_list.push(serializable.into());
+            }
         }
 
         Ok((valid_tokens, metadata_list))
@@ -550,13 +537,14 @@ impl MetadataStore for RedisStore {
 
         for (key, data) in all_keys.iter().zip(results.iter()) {
             if let Some(data) = data
-                && let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(data) {
-                    let metadata: FileMetadata = serializable.into();
-                    if now < metadata.expires_at {
-                        let token = key.strip_prefix("file:meta:").unwrap_or("").to_string();
-                        all_files.push((token, metadata));
-                    }
+                && let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(data)
+            {
+                let metadata: FileMetadata = serializable.into();
+                if now < metadata.expires_at {
+                    let token = key.strip_prefix("file:meta:").unwrap_or("").to_string();
+                    all_files.push((token, metadata));
                 }
+            }
         }
 
         let (paginated, total) =
@@ -646,59 +634,6 @@ struct ServerConfig {
     api_key: Option<String>,
     redis_addr: Option<String>,
     redis_db: i64,
-}
-
-struct UploadBuffer {
-    buf: Option<BytesMut>,
-}
-
-impl UploadBuffer {
-    fn new() -> Self {
-        let buffer = {
-            let mut pool = UPLOAD_BUFFER_POOL.lock();
-            pool.pop()
-        }
-        .unwrap_or_else(|| BytesMut::with_capacity(UPLOAD_BUFFER_SIZE));
-
-        Self { buf: Some(buffer) }
-    }
-
-    fn len(&self) -> usize {
-        self.buf.as_ref().map(|b| b.len()).unwrap_or(0)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.buf.as_ref().map(|b| b.as_ref()).unwrap_or_else(|| &[])
-    }
-
-    fn clear(&mut self) {
-        if let Some(buf) = self.buf.as_mut() {
-            buf.clear();
-        }
-    }
-
-    fn extend_from_slice(&mut self, data: &[u8]) {
-        if let Some(buf) = self.buf.as_mut() {
-            buf.extend_from_slice(data);
-        }
-    }
-}
-
-impl Drop for UploadBuffer {
-    fn drop(&mut self) {
-        if let Some(mut buf) = self.buf.take()
-            && buf.capacity() <= UPLOAD_BUFFER_MAX_RETENTION {
-                buf.clear();
-                let mut pool = UPLOAD_BUFFER_POOL.lock();
-                if pool.len() < UPLOAD_BUFFER_POOL_SIZE {
-                    pool.push(buf);
-                }
-            }
-    }
 }
 
 // ===========================
@@ -918,9 +853,9 @@ impl FileServer {
             fs::create_dir_all(parent).await?;
         }
 
-        let mut file = File::create(&full_path).await?;
+        let file = File::create(&full_path).await?;
+        let mut writer = BufWriter::with_capacity(FILE_WRITE_BUFFER_SIZE, file);
         let mut total_size: u64 = 0;
-        let mut buffer = UploadBuffer::new();
 
         loop {
             let maybe_chunk = field
@@ -938,38 +873,23 @@ impl FileServer {
                 .ok_or_else(|| SaveFileError::Stream("file size overflow".to_string()))?;
 
             if total_size > self.config.max_file_size {
-                drop(file);
+                drop(writer);
                 if let Err(e) = fs::remove_file(&full_path).await
-                    && e.kind() != std::io::ErrorKind::NotFound {
-                        error!(
-                            "Failed to remove oversized temp file {}: {}",
-                            full_path.display(),
-                            e
-                        );
-                    }
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    error!(
+                        "Failed to remove oversized temp file {}: {}",
+                        full_path.display(),
+                        e
+                    );
+                }
                 return Err(SaveFileError::TooLarge);
             }
 
-            if chunk_bytes.len() >= UPLOAD_BUFFER_SIZE {
-                if !buffer.is_empty() {
-                    file.write_all(buffer.as_slice()).await?;
-                    buffer.clear();
-                }
-                file.write_all(chunk_bytes).await?;
-                continue;
-            }
-
-            buffer.extend_from_slice(chunk_bytes);
-
-            if buffer.len() >= UPLOAD_BUFFER_SIZE {
-                file.write_all(buffer.as_slice()).await?;
-                buffer.clear();
-            }
+            writer.write_all(chunk_bytes).await?;
         }
 
-        if !buffer.is_empty() {
-            file.write_all(buffer.as_slice()).await?;
-        }
+        writer.flush().await?;
 
         let now = Utc::now();
         let extension_with_dot = extension
@@ -991,9 +911,10 @@ impl FileServer {
 
     async fn remove_file(&self, token: &str, metadata: &FileMetadata) {
         if let Err(e) = fs::remove_file(&metadata.storage_path).await
-            && e.kind() != std::io::ErrorKind::NotFound {
-                error!("Failed to remove file {}: {}", metadata.storage_path, e);
-            }
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            error!("Failed to remove file {}: {}", metadata.storage_path, e);
+        }
 
         if let Err(e) = self.store.remove(token).await {
             error!("Failed to remove metadata for token {}: {}", token, e);
@@ -1299,7 +1220,8 @@ async fn handle_list_files(
     let size: usize = params
         .get("size")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8192).clamp(1, 100);
+        .unwrap_or(8192)
+        .clamp(1, 100);
 
     let sort_by = params
         .get("sort_by")
