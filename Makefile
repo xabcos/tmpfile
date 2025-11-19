@@ -17,6 +17,9 @@ clean:
 fmt:
 	cargo fmt --all || true
 
+clippy:
+	cargo clippy -- -D warnings
+
 docker-build:
 	docker build -t $(IMAGE):$(SANITIZED_VERSION) .
 	docker push $(IMAGE):$(SANITIZED_VERSION)
