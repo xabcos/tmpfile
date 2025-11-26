@@ -1,7 +1,12 @@
 FROM rust:bookworm AS builder
 WORKDIR /app
+
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+COPY Cargo.toml .
+RUN cargo build --release && rm -rf src
+
 COPY . .
-RUN cargo build --release && mkdir uploads
+RUN touch src/main.rs && cargo build --release && mkdir -p uploads
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /home/nonroot
