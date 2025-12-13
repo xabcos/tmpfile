@@ -19,6 +19,8 @@ pub const FILE_WRITE_BUFFER_SIZE: usize = 128 * 1024;
 pub const TOKEN_CHARSET: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
 pub const TOKEN_LENGTH: usize = 8;
 pub const TOKEN_TIME_FORMAT: &str = "%m%d%H%M";
+pub const TOKEN_TIMESTAMP_LENGTH: usize = 8; // TOKEN_TIME_FORMAT output length
+pub const TOKEN_TOTAL_LENGTH: usize = TOKEN_LENGTH + TOKEN_TIMESTAMP_LENGTH;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -69,6 +71,8 @@ fn parse_duration_value(value: &str) -> Option<Duration> {
                 stripped.parse::<i64>().ok().map(Duration::days)
             } else if let Some(stripped) = value.strip_suffix('m') {
                 stripped.parse::<i64>().ok().map(Duration::minutes)
+            } else if let Some(stripped) = value.strip_suffix('s') {
+                stripped.parse::<i64>().ok().map(Duration::seconds)
             } else {
                 None
             }
@@ -79,6 +83,7 @@ fn parse_env_duration(key: &str, default: i64) -> Duration {
     env::var(key)
         .ok()
         .and_then(|v| parse_duration_value(&v))
+        .filter(|d| *d > Duration::zero())
         .unwrap_or_else(|| {
             info!("Using default {} seconds for {}", default, key);
             Duration::seconds(default)

@@ -1,3 +1,4 @@
+use crate::config::TOKEN_TOTAL_LENGTH;
 use crate::error::AppError;
 use crate::models::{FileItem, ListFilesResponse, UploadResponse};
 use crate::storage::{FileServer, TokenGenerator};
@@ -9,7 +10,6 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
@@ -17,22 +17,54 @@ use tracing::{error, info};
 
 type AppResult<T> = Result<T, AppError>;
 
+#[derive(serde::Deserialize)]
+pub(crate) struct ListFilesQuery {
+    page: Option<usize>,
+    size: Option<usize>,
+    sort_by: Option<String>,
+    order: Option<String>,
+}
+
+fn require_api_key(headers: &HeaderMap, expected_api_key: Option<&str>) -> AppResult<()> {
+    let Some(expected) = expected_api_key else {
+        return Ok(());
+    };
+
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    let provided_key = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    if provided_key != expected {
+        return Err(AppError::Unauthorized);
+    }
+
+    Ok(())
+}
+
+fn request_base_url(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.eq_ignore_ascii_case("https"))
+        .map(|_| "https")
+        .unwrap_or("http");
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost");
+
+    format!("{}://{}", scheme, host)
+}
+
 pub async fn handle_upload(
     State(server): State<Arc<FileServer>>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> AppResult<impl IntoResponse> {
-    if let Some(api_key) = &server.config.api_key {
-        let auth_header = headers
-            .get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-
-        let provided_key = auth_header.strip_prefix("Bearer ").unwrap_or("");
-        if provided_key != api_key {
-            return Err(AppError::Unauthorized);
-        }
-    }
+    require_api_key(&headers, server.config.api_key.as_deref())?;
 
     while let Some(field) = multipart
         .next_field()
@@ -61,33 +93,23 @@ pub async fn handle_upload(
 
             server
                 .store
-                .save(&token, metadata.clone(), ttl.to_std().unwrap())
+                .save(
+                    &token,
+                    metadata.clone(),
+                    ttl.to_std().map_err(|e| {
+                        AppError::InternalServerError(format!("Invalid TTL duration: {}", e))
+                    })?,
+                )
                 .await
                 .map_err(|e| {
                     error!("Failed to save metadata: {}", e);
                     AppError::InternalServerError("Failed to save metadata".to_string())
                 })?;
 
-            let scheme = if headers
-                .get("x-forwarded-proto")
-                .map(|v| v == "https")
-                .unwrap_or(false)
-            {
-                "https"
-            } else {
-                "http"
-            };
-
-            let host = headers
-                .get("host")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("localhost");
+            let base_url = request_base_url(&headers);
 
             let mut response = UploadResponse {
-                direct_link: format!(
-                    "{}://{}/files/{}{}",
-                    scheme, host, token, metadata.extension
-                ),
+                direct_link: format!("{}/files/{}{}", base_url, token, metadata.extension),
                 filename: metadata.original_name.clone(),
                 size: metadata.size,
                 token: token.clone(),
@@ -120,11 +142,9 @@ pub async fn handle_download(
     State(server): State<Arc<FileServer>>,
     Path(path): Path<String>,
 ) -> AppResult<impl IntoResponse> {
-    let token = if path.len() >= 16 {
-        &path[..16]
-    } else {
-        return Err(AppError::BadRequest("Invalid token".to_string()));
-    };
+    let token = path
+        .get(..TOKEN_TOTAL_LENGTH)
+        .ok_or_else(|| AppError::BadRequest("Invalid token".to_string()))?;
 
     let metadata = server.store.load(token).await?;
 
@@ -212,42 +232,19 @@ pub async fn handle_download(
 pub async fn handle_list_files(
     State(server): State<Arc<FileServer>>,
     headers: HeaderMap,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    axum::extract::Query(params): axum::extract::Query<ListFilesQuery>,
 ) -> AppResult<impl IntoResponse> {
-    // Validate API key if configured
-    if let Some(api_key) = &server.config.api_key {
-        let auth_header = headers
-            .get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-
-        let provided_key = auth_header.strip_prefix("Bearer ").unwrap_or("");
-        if provided_key != api_key {
-            return Err(AppError::Unauthorized);
-        }
-    }
+    require_api_key(&headers, server.config.api_key.as_deref())?;
 
     // Parse query parameters
-    let page: usize = params
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1)
-        .max(1);
-
-    let size: usize = params
-        .get("size")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192)
-        .clamp(1, 100);
-
-    let sort_by = params
-        .get("sort_by")
-        .map(|s| s.as_str())
-        .unwrap_or("uploaded_at");
-
-    let order = params.get("order").map(|o| o.as_str()).unwrap_or("desc");
-
-    let desc = order == "desc";
+    let page = params.page.unwrap_or(1).max(1);
+    let size = params.size.unwrap_or(100).clamp(1, 100);
+    let sort_by = params.sort_by.as_deref().unwrap_or("uploaded_at");
+    let desc = params
+        .order
+        .as_deref()
+        .unwrap_or("desc")
+        .eq_ignore_ascii_case("desc");
 
     // Calculate offset
     let offset = (page - 1) * size;
@@ -256,28 +253,12 @@ pub async fn handle_list_files(
     let (files, total) = server.store.list_files(offset, size, sort_by, desc).await?;
 
     // Build response with download links
-    let scheme = if headers
-        .get("x-forwarded-proto")
-        .map(|v| v == "https")
-        .unwrap_or(false)
-    {
-        "https"
-    } else {
-        "http"
-    };
-
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
+    let base_url = request_base_url(&headers);
 
     let file_items: Vec<FileItem> = files
         .into_iter()
         .map(|(token, metadata)| FileItem {
-            download_link: format!(
-                "{}://{}/files/{}{}",
-                scheme, host, token, metadata.extension
-            ),
+            download_link: format!("{}/files/{}{}", base_url, token, metadata.extension),
             filename: metadata.original_name.clone(),
             size: metadata.size,
             uploaded_at: metadata.uploaded_at,

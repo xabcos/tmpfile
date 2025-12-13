@@ -1,6 +1,7 @@
 use crate::config::{
     CLEANUP_BATCH_SIZE, FILE_WRITE_BUFFER_SIZE, MEMORY_SHARD_COUNT, STARTUP_CLEANUP_CONCURRENCY,
     STORAGE_SUBDIR_DEPTH, ServerConfig, TOKEN_CHARSET, TOKEN_LENGTH, TOKEN_TIME_FORMAT,
+    TOKEN_TOTAL_LENGTH,
 };
 use crate::error::AppError;
 use crate::models::{FileMetadata, SerializableMetadata};
@@ -10,6 +11,7 @@ use parking_lot::RwLock;
 use rand::Rng;
 use redis::{AsyncCommands, Client, Script, aio::ConnectionManager};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -32,14 +34,14 @@ impl TokenGenerator {
     pub fn generate() -> String {
         let mut rng = rand::rng();
         let charset = TOKEN_CHARSET.as_bytes();
-        let mut token = String::with_capacity(TOKEN_LENGTH + TOKEN_TIME_FORMAT.len());
+        let mut token = String::with_capacity(TOKEN_TOTAL_LENGTH);
 
         for _ in 0..TOKEN_LENGTH {
             let idx = rng.random_range(0..charset.len());
             token.push(char::from(charset[idx]));
         }
 
-        token.push_str(&Utc::now().format(TOKEN_TIME_FORMAT).to_string());
+        let _ = write!(&mut token, "{}", Utc::now().format(TOKEN_TIME_FORMAT));
         token
     }
 }
@@ -277,6 +279,91 @@ return metadata.download_count
     }
 
     const EXPIRY_SET_KEY: &'static str = "file:expiry:set";
+    const UPLOADED_SET_KEY: &'static str = "file:uploaded:set";
+
+    async fn list_files_by_uploaded_at(
+        &self,
+        conn: &mut ConnectionManager,
+        offset: usize,
+        limit: usize,
+        desc: bool,
+    ) -> AppResult<(Vec<(String, FileMetadata)>, usize)> {
+        let now = Utc::now();
+        let now_ts = now.timestamp();
+
+        let total: i64 = conn
+            .zcount(Self::EXPIRY_SET_KEY, format!("({}", now_ts), "+inf")
+            .await
+            .map_err(AppError::from)?;
+
+        if total <= 0 {
+            return Ok((vec![], 0));
+        }
+
+        let mut files = Vec::with_capacity(limit);
+        let mut active_seen = 0usize;
+        let mut zset_index = 0usize;
+
+        // Fetch enough candidates to cover expired entries without scanning the whole set.
+        let chunk_size = std::cmp::max(limit.saturating_mul(8), 256);
+
+        while files.len() < limit {
+            let start = isize::try_from(zset_index)
+                .map_err(|_| AppError::BadRequest("page too large".to_string()))?;
+            let stop = isize::try_from(zset_index.saturating_add(chunk_size).saturating_sub(1))
+                .map_err(|_| AppError::BadRequest("page too large".to_string()))?;
+
+            let tokens: Vec<String> = if desc {
+                conn.zrevrange(Self::UPLOADED_SET_KEY, start, stop)
+                    .await
+                    .map_err(AppError::from)?
+            } else {
+                conn.zrange(Self::UPLOADED_SET_KEY, start, stop)
+                    .await
+                    .map_err(AppError::from)?
+            };
+
+            if tokens.is_empty() {
+                break;
+            }
+
+            let batch_len = tokens.len();
+
+            let mut pipe = redis::pipe();
+            for token in &tokens {
+                pipe.get(self.metadata_key(token));
+            }
+
+            let results: Vec<Option<String>> =
+                pipe.query_async(conn).await.map_err(AppError::from)?;
+
+            for (token, data) in tokens.into_iter().zip(results.into_iter()) {
+                let Some(data) = data else { continue };
+                let Ok(serializable) = serde_json::from_str::<SerializableMetadata>(&data) else {
+                    continue;
+                };
+                let metadata: FileMetadata = serializable.into();
+
+                if now >= metadata.expires_at {
+                    continue;
+                }
+
+                if active_seen < offset {
+                    active_seen += 1;
+                    continue;
+                }
+
+                files.push((token, metadata));
+                if files.len() >= limit {
+                    break;
+                }
+            }
+
+            zset_index = zset_index.saturating_add(batch_len);
+        }
+
+        Ok((files, total as usize))
+    }
 }
 
 #[async_trait::async_trait]
@@ -294,6 +381,11 @@ impl MetadataStore for RedisStore {
             .atomic()
             .set_ex(&key, data, ttl_secs)
             .zadd(Self::EXPIRY_SET_KEY, token, metadata.expires_at.timestamp())
+            .zadd(
+                Self::UPLOADED_SET_KEY,
+                token,
+                metadata.uploaded_at.timestamp(),
+            )
             .query_async::<()>(&mut conn)
             .await
             .map_err(AppError::from)?;
@@ -343,6 +435,7 @@ impl MetadataStore for RedisStore {
             .atomic()
             .del(&key)
             .zrem(Self::EXPIRY_SET_KEY, token)
+            .zrem(Self::UPLOADED_SET_KEY, token)
             .query_async::<()>(&mut conn)
             .await
             .map_err(AppError::from)?;
@@ -394,6 +487,24 @@ impl MetadataStore for RedisStore {
         desc: bool,
     ) -> AppResult<(Vec<(String, FileMetadata)>, usize)> {
         let mut conn = self.conn_manager.clone();
+
+        if sort_by == "uploaded_at" {
+            let uploaded_count: i64 = conn
+                .zcard(Self::UPLOADED_SET_KEY)
+                .await
+                .map_err(AppError::from)?;
+            let expiry_count: i64 = conn
+                .zcard(Self::EXPIRY_SET_KEY)
+                .await
+                .map_err(AppError::from)?;
+
+            if uploaded_count > 0 && uploaded_count == expiry_count {
+                return self
+                    .list_files_by_uploaded_at(&mut conn, offset, limit, desc)
+                    .await;
+            }
+        }
+
         let pattern = self.metadata_key("*");
 
         let mut all_keys = Vec::new();
@@ -573,9 +684,7 @@ impl FileServer {
             .and_then(|n| n.to_str())
             .ok_or_else(|| "Invalid filename".to_string())?;
 
-        let token = if filename.len() >= 16 {
-            &filename[..16]
-        } else {
+        let Some(token) = filename.get(..TOKEN_TOTAL_LENGTH) else {
             info!("Found unrecognized file: {:?}", path);
             return Ok((false, 0));
         };
@@ -632,7 +741,7 @@ impl FileServer {
     }
 
     pub fn get_storage_path(&self, token: &str) -> PathBuf {
-        let subdir = &token[..STORAGE_SUBDIR_DEPTH];
+        let subdir = token.get(..STORAGE_SUBDIR_DEPTH).unwrap_or(token);
         PathBuf::from(&self.config.upload_dir)
             .join(subdir)
             .join(token)
@@ -729,7 +838,15 @@ impl FileServer {
     }
 
     pub async fn cleanup_worker(server: Arc<FileServer>) {
-        let mut interval = interval(server.config.cleanup_interval.to_std().unwrap());
+        let cleanup_interval = server.config.cleanup_interval.to_std().unwrap_or_else(|e| {
+            error!(
+                "Invalid cleanup interval {:?}: {}. Falling back to 60s.",
+                server.config.cleanup_interval, e
+            );
+            StdDuration::from_secs(60)
+        });
+
+        let mut interval = interval(std::cmp::max(cleanup_interval, StdDuration::from_secs(1)));
 
         loop {
             interval.tick().await;
