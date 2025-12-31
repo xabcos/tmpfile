@@ -772,10 +772,7 @@ impl FileServer {
         let mut total_size: u64 = 0;
 
         loop {
-            let maybe_chunk = field
-                .chunk()
-                .await
-                .map_err(|err| AppError::BadRequest(format!("Stream error: {}", err)))?;
+            let maybe_chunk = field.chunk().await.map_err(AppError::from)?;
 
             let Some(chunk) = maybe_chunk else {
                 break;

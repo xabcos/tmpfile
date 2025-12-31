@@ -6,6 +6,7 @@ mod storage;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use config::ServerConfig;
@@ -56,12 +57,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         FileServer::cleanup_worker(cleanup_server).await;
     });
 
+    let max_body_size = config.max_file_size.min(usize::MAX as u64) as usize;
+
     let app = Router::new()
         .route("/upload", post(handlers::handle_upload))
         .route("/files/{path}", get(handlers::handle_download))
         .route("/list", get(handlers::handle_list_files))
         .layer(
-            ServiceBuilder::new().layer(RequestBodyLimitLayer::new(config.max_file_size as usize)),
+            ServiceBuilder::new()
+                .layer(DefaultBodyLimit::max(max_body_size))
+                .layer(RequestBodyLimitLayer::new(max_body_size)),
         )
         .with_state(server);
 

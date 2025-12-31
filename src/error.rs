@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    extract::multipart::MultipartError,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -68,5 +69,16 @@ impl From<redis::RedisError> for AppError {
 impl From<serde_json::Error> for AppError {
     fn from(err: serde_json::Error) -> Self {
         AppError::InternalServerError(format!("Serialization Error: {}", err))
+    }
+}
+
+impl From<MultipartError> for AppError {
+    fn from(err: MultipartError) -> Self {
+        match err.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => AppError::PayloadTooLarge,
+            StatusCode::BAD_REQUEST => AppError::BadRequest(err.body_text()),
+            StatusCode::INTERNAL_SERVER_ERROR => AppError::InternalServerError(err.body_text()),
+            status => AppError::InternalServerError(format!("Multipart error: {}", status)),
+        }
     }
 }

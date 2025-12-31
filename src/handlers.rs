@@ -66,11 +66,7 @@ pub async fn handle_upload(
 ) -> AppResult<impl IntoResponse> {
     require_api_key(&headers, server.config.api_key.as_deref())?;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| AppError::BadRequest("Multipart error".to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(AppError::from)? {
         if field.name() == Some("file") {
             let filename = field
                 .file_name()
