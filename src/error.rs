@@ -1,10 +1,8 @@
 use axum::{
-    Json,
     extract::multipart::MultipartError,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde_json::json;
 use std::fmt;
 
 #[derive(Debug)]
@@ -46,11 +44,7 @@ impl IntoResponse for AppError {
             AppError::InternalServerError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
-        let body = Json(json!({
-            "error": message,
-        }));
-
-        (status, body).into_response()
+        (status, message).into_response()
     }
 }
 
