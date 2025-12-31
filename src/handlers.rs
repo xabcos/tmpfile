@@ -173,7 +173,7 @@ pub async fn handle_download(
         match server_clone.store.increment_downloads(&token_owned).await {
             Ok(new_count) => {
                 info!(
-                    "Download: {} -> {} (count: {}/{})",
+                    "Download: {} -> {} ({}/{})",
                     metadata_clone.original_name,
                     token_owned,
                     new_count,
