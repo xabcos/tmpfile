@@ -4,7 +4,7 @@ WORKDIR /app
 COPY . .
 RUN cargo build --release && mkdir -p uploads
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot
 WORKDIR /home/nonroot
 COPY --from=builder --chown=nonroot:nonroot /app/target/release/tmpfile .
 COPY --from=builder --chown=nonroot:nonroot /app/uploads ./uploads
