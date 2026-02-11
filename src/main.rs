@@ -12,7 +12,6 @@ use axum::{
 use config::ServerConfig;
 use std::sync::Arc;
 use storage::FileServer;
-use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 
@@ -63,11 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/upload", post(handlers::handle_upload))
         .route("/files/{path}", get(handlers::handle_download))
         .route("/list", get(handlers::handle_list_files))
-        .layer(
-            ServiceBuilder::new()
-                .layer(DefaultBodyLimit::max(max_body_size))
-                .layer(RequestBodyLimitLayer::new(max_body_size)),
-        )
+        .layer(DefaultBodyLimit::max(max_body_size))
+        .layer(RequestBodyLimitLayer::new(max_body_size))
         .with_state(server);
 
     let addr: std::net::SocketAddr = config.listen_addr.parse()?;

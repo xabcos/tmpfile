@@ -7,17 +7,14 @@ edition = "2024"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["limit"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = { version = "0.4", features = ["serde"] }
-redis = { version = "0.32", features = ["tokio-comp", "connection-manager", "aio"] }
-rand = "0.9"
+chrono = "0.4"
+redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager", "aio", "script"] }
+rand = "0.10"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-parking_lot = "0.12"
 
 [profile.release]
 codegen-units = 1

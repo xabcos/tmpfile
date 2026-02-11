@@ -1,7 +1,7 @@
 use crate::config::TOKEN_TOTAL_LENGTH;
 use crate::error::AppError;
 use crate::models::{FileItem, ListFilesResponse, UploadResponse};
-use crate::storage::{FileServer, TokenGenerator};
+use crate::storage::{DownloadClaim, FileServer, TokenGenerator};
 use axum::{
     Json,
     body::Body,
@@ -148,7 +148,14 @@ pub async fn handle_download(
         return Err(AppError::Gone("File expired".to_string()));
     }
 
-    if metadata.download_limit > 0 && metadata.download_count >= metadata.download_limit {
+    // Open file for streaming
+    let file = File::open(&metadata.storage_path)
+        .await
+        .map_err(|_| AppError::NotFound("File on disk not found".to_string()))?;
+
+    let claim = server.store.claim_download(token).await?;
+
+    if matches!(claim, DownloadClaim::LimitReached) {
         let server_clone = server.clone();
         let token_owned = token.to_string();
         let metadata_clone = metadata.clone();
@@ -160,42 +167,34 @@ pub async fn handle_download(
         return Err(AppError::Gone("Download limit reached".to_string()));
     }
 
-    // Open file for streaming
-    let file = File::open(&metadata.storage_path)
-        .await
-        .map_err(|_| AppError::NotFound("File on disk not found".to_string()))?;
+    let DownloadClaim::Allowed { new_count } = claim else {
+        return Err(AppError::InternalServerError(
+            "unexpected download claim result".to_string(),
+        ));
+    };
 
-    // Asynchronously update download count to avoid blocking the response
-    let server_clone = server.clone();
-    let token_owned = token.to_string();
-    let metadata_clone = metadata.clone();
-    tokio::spawn(async move {
-        match server_clone.store.increment_downloads(&token_owned).await {
-            Ok(new_count) => {
-                info!(
-                    "Download: {} -> {} ({}/{})",
-                    metadata_clone.original_name,
-                    token_owned,
-                    new_count,
-                    if metadata_clone.download_limit > 0 {
-                        metadata_clone.download_limit.to_string()
-                    } else {
-                        "unlimited".to_string()
-                    }
-                );
-
-                // Remove file if download limit reached
-                if metadata_clone.download_limit > 0 && new_count >= metadata_clone.download_limit {
-                    server_clone
-                        .remove_file(&token_owned, &metadata_clone)
-                        .await;
-                }
-            }
-            Err(_) => {
-                // Ignore errors in background task
-            }
+    info!(
+        "Download: {} -> {} ({}/{})",
+        metadata.original_name,
+        token,
+        new_count,
+        if metadata.download_limit > 0 {
+            metadata.download_limit.to_string()
+        } else {
+            "unlimited".to_string()
         }
-    });
+    );
+
+    if metadata.download_limit > 0 && new_count >= metadata.download_limit {
+        let server_clone = server.clone();
+        let token_owned = token.to_string();
+        let metadata_clone = metadata.clone();
+        tokio::spawn(async move {
+            server_clone
+                .remove_file(&token_owned, &metadata_clone)
+                .await;
+        });
+    }
 
     // Set response headers
     let mut headers = HeaderMap::new();

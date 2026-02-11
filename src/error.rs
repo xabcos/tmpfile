@@ -60,12 +60,6 @@ impl From<redis::RedisError> for AppError {
     }
 }
 
-impl From<serde_json::Error> for AppError {
-    fn from(err: serde_json::Error) -> Self {
-        AppError::InternalServerError(format!("Serialization Error: {}", err))
-    }
-}
-
 impl From<MultipartError> for AppError {
     fn from(err: MultipartError) -> Self {
         match err.status() {
