@@ -68,7 +68,10 @@ impl FileServer {
             AppError::InternalServerError(format!("Failed to read directory entry: {}", e))
         })? {
             let path = entry.path();
-            if path.is_dir() {
+            let entry_type = entry.file_type().await.map_err(|e| {
+                AppError::InternalServerError(format!("Failed to read directory entry type: {}", e))
+            })?;
+            if entry_type.is_dir() {
                 let mut subdir_entries = fs::read_dir(&path).await.map_err(|e| {
                     AppError::InternalServerError(format!("Failed to read subdirectory: {}", e))
                 })?;
@@ -77,7 +80,10 @@ impl FileServer {
                     AppError::InternalServerError(format!("Failed to read file entry: {}", e))
                 })? {
                     let file_path = file_entry.path();
-                    if file_path.is_file() {
+                    let file_type = file_entry.file_type().await.map_err(|e| {
+                        AppError::InternalServerError(format!("Failed to read file type: {}", e))
+                    })?;
+                    if file_type.is_file() {
                         let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
                             AppError::InternalServerError(format!(
                                 "Cleanup semaphore closed: {}",
@@ -314,19 +320,18 @@ impl FileServer {
 
                     let count = tokens.len();
 
-                    let tasks: Vec<_> = tokens
-                        .into_iter()
-                        .zip(metadata_list.into_iter())
-                        .map(|(token, metadata)| {
-                            let server = self.clone();
-                            tokio::spawn(async move {
-                                server.remove_file(&token, &metadata).await;
-                            })
-                        })
-                        .collect();
+                    let mut join_set = JoinSet::new();
+                    for (token, metadata) in tokens.into_iter().zip(metadata_list.into_iter()) {
+                        let server = self.clone();
+                        join_set.spawn(async move {
+                            server.remove_file(&token, &metadata).await;
+                        });
+                    }
 
-                    for task in tasks {
-                        let _ = task.await;
+                    while let Some(result) = join_set.join_next().await {
+                        if let Err(e) = result {
+                            error!("Cleanup task panicked: {}", e);
+                        }
                     }
 
                     info!("Cleaned up {} expired files", count);

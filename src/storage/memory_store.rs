@@ -4,17 +4,14 @@ use crate::error::AppError;
 use crate::models::FileMetadata;
 use chrono::{Duration, Utc};
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use tokio::sync::RwLock;
 
 type MemoryShard = Arc<RwLock<HashMap<String, FileMetadata>>>;
 
 pub struct MemoryStore {
     shards: Vec<MemoryShard>,
-}
-
-fn map_lock_poison<T>(_: PoisonError<T>) -> AppError {
-    AppError::InternalServerError("memory store lock poisoned".to_string())
 }
 
 impl MemoryStore {
@@ -42,7 +39,7 @@ impl MetadataStore for MemoryStore {
         ttl: StdDuration,
     ) -> AppResult<()> {
         let shard = self.get_shard_for_token(token);
-        let mut guard = shard.write().map_err(map_lock_poison)?;
+        let mut guard = shard.write().await;
         let ttl_duration =
             Duration::from_std(ttl).map_err(|e| AppError::InternalServerError(e.to_string()))?;
         metadata.expires_at = Utc::now() + ttl_duration;
@@ -52,7 +49,7 @@ impl MetadataStore for MemoryStore {
 
     async fn load(&self, token: &str) -> AppResult<FileMetadata> {
         let shard = self.get_shard_for_token(token);
-        let guard = shard.read().map_err(map_lock_poison)?;
+        let guard = shard.read().await;
         guard
             .get(token)
             .cloned()
@@ -61,7 +58,7 @@ impl MetadataStore for MemoryStore {
 
     async fn claim_download(&self, token: &str) -> AppResult<DownloadClaim> {
         let shard = self.get_shard_for_token(token);
-        let mut guard = shard.write().map_err(map_lock_poison)?;
+        let mut guard = shard.write().await;
         let metadata = guard
             .get_mut(token)
             .ok_or_else(|| AppError::NotFound("file not found".to_string()))?;
@@ -78,7 +75,7 @@ impl MetadataStore for MemoryStore {
 
     async fn remove(&self, token: &str) -> AppResult<()> {
         let shard = self.get_shard_for_token(token);
-        let mut guard = shard.write().map_err(map_lock_poison)?;
+        let mut guard = shard.write().await;
         guard.remove(token);
         Ok(())
     }
@@ -89,7 +86,7 @@ impl MetadataStore for MemoryStore {
         let now = Utc::now();
 
         for shard in &self.shards {
-            let guard = shard.read().map_err(map_lock_poison)?;
+            let guard = shard.read().await;
             for (token, meta) in guard.iter() {
                 if now > meta.expires_at {
                     tokens.push(token.clone());
@@ -115,7 +112,7 @@ impl MetadataStore for MemoryStore {
         let now = Utc::now();
 
         for shard in &self.shards {
-            let guard = shard.read().map_err(map_lock_poison)?;
+            let guard = shard.read().await;
             for (token, meta) in guard.iter() {
                 if now < meta.expires_at {
                     all_files.push((token.clone(), meta.clone()));

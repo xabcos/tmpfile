@@ -17,12 +17,51 @@ use tracing::{error, info};
 
 type AppResult<T> = Result<T, AppError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ListSortBy {
+    UploadedAt,
+    Size,
+    Name,
+}
+
+impl ListSortBy {
+    fn as_store_key(self) -> &'static str {
+        match self {
+            Self::UploadedAt => "uploaded_at",
+            Self::Size => "size",
+            Self::Name => "name",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ListSortOrder {
+    Asc,
+    Desc,
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct ListFilesQuery {
     page: Option<usize>,
     size: Option<usize>,
-    sort_by: Option<String>,
-    order: Option<String>,
+    sort_by: Option<ListSortBy>,
+    order: Option<ListSortOrder>,
+}
+
+impl ListFilesQuery {
+    fn normalized(&self) -> (usize, usize, ListSortBy, bool) {
+        let page = self.page.unwrap_or(1).max(1);
+        let size = self.size.unwrap_or(100).clamp(1, 100);
+        let sort_by = self.sort_by.unwrap_or(ListSortBy::UploadedAt);
+        let desc = matches!(
+            self.order.unwrap_or(ListSortOrder::Desc),
+            ListSortOrder::Desc
+        );
+
+        (page, size, sort_by, desc)
+    }
 }
 
 fn require_api_key(headers: &HeaderMap, expected_api_key: Option<&str>) -> AppResult<()> {
@@ -232,20 +271,16 @@ pub async fn handle_list_files(
     require_api_key(&headers, server.config.api_key.as_deref())?;
 
     // Parse query parameters
-    let page = params.page.unwrap_or(1).max(1);
-    let size = params.size.unwrap_or(100).clamp(1, 100);
-    let sort_by = params.sort_by.as_deref().unwrap_or("uploaded_at");
-    let desc = params
-        .order
-        .as_deref()
-        .unwrap_or("desc")
-        .eq_ignore_ascii_case("desc");
+    let (page, size, sort_by, desc) = params.normalized();
 
     // Calculate offset
     let offset = (page - 1) * size;
 
     // Get file list
-    let (files, total) = server.store.list_files(offset, size, sort_by, desc).await?;
+    let (files, total) = server
+        .store
+        .list_files(offset, size, sort_by.as_store_key(), desc)
+        .await?;
 
     // Build response with download links
     let base_url = request_base_url(&headers);

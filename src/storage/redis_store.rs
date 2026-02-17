@@ -153,24 +153,15 @@ return new_count
         desc: bool,
     ) -> AppResult<(Vec<(String, FileMetadata)>, usize)> {
         let now = Utc::now();
-        let now_ts = now.timestamp();
-
-        let total: i64 = conn
-            .zcount(Self::EXPIRY_SET_KEY, format!("({}", now_ts), "+inf")
-            .await
-            .map_err(AppError::from)?;
-
-        if total <= 0 {
-            return Ok((vec![], 0));
-        }
 
         let mut files = Vec::with_capacity(limit);
         let mut active_seen = 0usize;
+        let mut total_active = 0usize;
         let mut zset_index = 0usize;
 
         let chunk_size = std::cmp::max(limit.saturating_mul(8), 256);
 
-        while files.len() < limit {
+        loop {
             let start = isize::try_from(zset_index)
                 .map_err(|_| AppError::BadRequest("page too large".to_string()))?;
             let stop = isize::try_from(zset_index.saturating_add(chunk_size).saturating_sub(1))
@@ -212,15 +203,11 @@ return new_count
             let results: Vec<Vec<Option<String>>> =
                 pipe.query_async(conn).await.map_err(AppError::from)?;
 
+            let mut stale_tokens = Vec::new();
+
             for (token, values) in tokens.into_iter().zip(results.into_iter()) {
                 let Some(metadata) = Self::parse_hash_metadata(&token, values)? else {
-                    redis::pipe()
-                        .atomic()
-                        .zrem(Self::EXPIRY_SET_KEY, &token)
-                        .zrem(Self::UPLOADED_SET_KEY, &token)
-                        .query_async::<()>(conn)
-                        .await
-                        .map_err(AppError::from)?;
+                    stale_tokens.push(token);
                     continue;
                 };
 
@@ -228,21 +215,35 @@ return new_count
                     continue;
                 }
 
+                total_active += 1;
+
                 if active_seen < offset {
                     active_seen += 1;
                     continue;
                 }
 
-                files.push((token, metadata));
-                if files.len() >= limit {
-                    break;
+                if files.len() < limit {
+                    files.push((token, metadata));
                 }
+            }
+
+            if !stale_tokens.is_empty() {
+                let mut cleanup_pipe = redis::pipe();
+                cleanup_pipe.atomic();
+                for token in &stale_tokens {
+                    cleanup_pipe.zrem(Self::EXPIRY_SET_KEY, token);
+                    cleanup_pipe.zrem(Self::UPLOADED_SET_KEY, token);
+                }
+                cleanup_pipe
+                    .query_async::<()>(conn)
+                    .await
+                    .map_err(AppError::from)?;
             }
 
             zset_index = zset_index.saturating_add(batch_len);
         }
 
-        Ok((files, total as usize))
+        Ok((files, total_active))
     }
 }
 

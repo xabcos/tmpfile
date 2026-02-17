@@ -4,17 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "time", "sync"] }
-tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.6", features = ["limit"] }
-serde = { version = "1", features = ["derive"] }
-chrono = "0.4"
+axum = { version = "0.8.8", features = ["multipart"] }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "time", "sync"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+tower-http = { version = "0.6.8", features = ["limit"] }
+serde = { version = "1.0.228", features = ["derive"] }
+chrono = "0.4.43"
 redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager", "aio", "script"] }
-rand = "0.10"
-async-trait = "0.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.10.0"
+async-trait = "0.1.89"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [profile.release]
 codegen-units = 1
