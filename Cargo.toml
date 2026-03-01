@@ -9,8 +9,8 @@ tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "net", "f
 tokio-util = { version = "0.7.18", features = ["io"] }
 tower-http = { version = "0.6.8", features = ["limit"] }
 serde = { version = "1.0.228", features = ["derive"] }
-chrono = "0.4.43"
-redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager", "aio", "script"] }
+chrono = "0.4.44"
+redis = { version = "1.0.4", features = ["tokio-comp", "connection-manager", "aio", "script"] }
 rand = "0.10.0"
 async-trait = "0.1.89"
 tracing = "0.1.44"
