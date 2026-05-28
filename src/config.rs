@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub file_expiration: Duration,
     pub cleanup_interval: Duration,
     pub max_download_count: i32,
+    pub image_max_download_count: i32,
+    pub public_base_url: Option<String>,
     pub api_key: Option<String>,
     pub redis_addr: Option<String>,
     pub redis_db: i64,
@@ -49,6 +51,11 @@ impl ServerConfig {
             file_expiration,
             cleanup_interval,
             max_download_count: parse_env_int("MAX_DOWNLOAD_COUNT", DEFAULT_MAX_DOWNLOAD_COUNT),
+            image_max_download_count: parse_env_int("IMAGE_MAX_DOWNLOAD_COUNT", 0),
+            public_base_url: env::var("PUBLIC_BASE_URL")
+                .ok()
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty()),
             api_key: env::var("API_KEY").ok().filter(|s| !s.is_empty()),
             redis_addr: env::var("REDIS_ADDR").ok().filter(|s| !s.is_empty()),
             redis_db: env::var("REDIS_DB")

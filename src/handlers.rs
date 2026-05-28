@@ -11,7 +11,7 @@ use axum::{
 };
 use chrono::Utc;
 use std::sync::Arc;
-use tokio::fs::File;
+use tokio::fs::{self, File};
 use tokio_util::io::ReaderStream;
 use tracing::{error, info};
 
@@ -82,7 +82,11 @@ fn require_api_key(headers: &HeaderMap, expected_api_key: Option<&str>) -> AppRe
     Ok(())
 }
 
-fn request_base_url(headers: &HeaderMap) -> String {
+fn request_base_url(headers: &HeaderMap, public_base_url: Option<&str>) -> String {
+    if let Some(base_url) = public_base_url {
+        return base_url.to_string();
+    }
+
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -96,6 +100,43 @@ fn request_base_url(headers: &HeaderMap) -> String {
         .unwrap_or("localhost");
 
     format!("{}://{}", scheme, host)
+}
+
+fn content_type_for_extension(extension: &str) -> &'static str {
+    match extension
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn is_inline_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "image/png"
+            | "image/jpeg"
+            | "image/webp"
+            | "image/gif"
+            | "image/avif"
+            | "image/x-icon"
+            | "image/bmp"
+    )
 }
 
 pub async fn handle_upload(
@@ -126,7 +167,7 @@ pub async fn handle_upload(
                 server.config.file_expiration
             };
 
-            server
+            if let Err(e) = server
                 .store
                 .save(
                     &token,
@@ -136,12 +177,22 @@ pub async fn handle_upload(
                     })?,
                 )
                 .await
-                .map_err(|e| {
-                    error!("Failed to save metadata: {}", e);
-                    AppError::InternalServerError("Failed to save metadata".to_string())
-                })?;
+            {
+                error!("Failed to save metadata: {}", e);
+                if let Err(remove_err) = fs::remove_file(&metadata.storage_path).await
+                    && remove_err.kind() != std::io::ErrorKind::NotFound
+                {
+                    error!(
+                        "Failed to remove file after metadata save failure {}: {}",
+                        metadata.storage_path, remove_err
+                    );
+                }
+                return Err(AppError::InternalServerError(
+                    "Failed to save metadata".to_string(),
+                ));
+            }
 
-            let base_url = request_base_url(&headers);
+            let base_url = request_base_url(&headers, server.config.public_base_url.as_deref());
 
             let mut response = UploadResponse {
                 direct_link: format!("{}/files/{}{}", base_url, token, metadata.extension),
@@ -154,9 +205,9 @@ pub async fn handle_upload(
                 remaining_downloads: None,
             };
 
-            if server.config.max_download_count > 0 {
-                response.max_downloads = Some(server.config.max_download_count);
-                response.remaining_downloads = Some(server.config.max_download_count);
+            if metadata.download_limit > 0 {
+                response.max_downloads = Some(metadata.download_limit);
+                response.remaining_downloads = Some(metadata.download_limit);
             }
 
             info!(
@@ -235,17 +286,21 @@ pub async fn handle_download(
         });
     }
 
+    let content_type = content_type_for_extension(&metadata.extension);
+    let disposition = if is_inline_content_type(content_type) {
+        "inline"
+    } else {
+        "attachment"
+    };
+
     // Set response headers
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!(
-            "attachment; filename=\"{}\"",
-            metadata.original_name
+            "{}; filename=\"{}\"",
+            disposition, metadata.original_name
         ))
         .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
@@ -283,7 +338,7 @@ pub async fn handle_list_files(
         .await?;
 
     // Build response with download links
-    let base_url = request_base_url(&headers);
+    let base_url = request_base_url(&headers, server.config.public_base_url.as_deref());
 
     let file_items: Vec<FileItem> = files
         .into_iter()

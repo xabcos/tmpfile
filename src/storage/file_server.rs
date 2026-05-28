@@ -267,6 +267,11 @@ impl FileServer {
             .map(|ext| format!(".{}", ext))
             .unwrap_or_default();
 
+        let is_image = extension
+            .as_deref()
+            .map(is_image_extension)
+            .unwrap_or(false);
+
         Ok(FileMetadata {
             original_name: filename.to_string(),
             storage_path: full_path.to_string_lossy().to_string(),
@@ -275,7 +280,11 @@ impl FileServer {
             uploaded_at: now,
             expires_at: now + self.config.file_expiration,
             download_count: 0,
-            download_limit: self.config.max_download_count,
+            download_limit: if is_image {
+                self.config.image_max_download_count
+            } else {
+                self.config.max_download_count
+            },
         })
     }
 
@@ -347,4 +356,11 @@ impl FileServer {
             }
         }
     }
+}
+
+fn is_image_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" | "svg" | "ico" | "bmp"
+    )
 }

@@ -3,13 +3,25 @@ use crate::error::AppError;
 use crate::models::FileMetadata;
 use chrono::{DateTime, Utc};
 use redis::{AsyncCommands, Client, Script, aio::ConnectionManager};
-use std::time::Duration as StdDuration;
-use tracing::info;
+use std::{future::Future, time::Duration as StdDuration};
+use tracing::{info, warn};
 
 pub struct RedisStore {
     conn_manager: ConnectionManager,
     claim_download_script: Script,
 }
+
+const REDIS_CONNECTION_RETRIES: usize = 1;
+const METADATA_FIELDS: [&str; 8] = [
+    "original_name",
+    "storage_path",
+    "size",
+    "extension",
+    "uploaded_at",
+    "expires_at",
+    "download_count",
+    "download_limit",
+];
 
 fn parse_dt_rfc3339(value: &str, field: &str) -> AppResult<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
@@ -76,6 +88,77 @@ return new_count
         format!("file:meta:{}", token)
     }
 
+    fn should_retry_connection_error(err: &redis::RedisError) -> bool {
+        err.is_io_error() || err.is_connection_dropped() || err.is_timeout()
+    }
+
+    async fn redis_retry<T, F, Fut>(&self, operation: &str, mut f: F) -> AppResult<T>
+    where
+        F: FnMut(ConnectionManager) -> Fut,
+        Fut: Future<Output = redis::RedisResult<T>>,
+    {
+        let mut attempt = 0;
+
+        loop {
+            let conn = self.conn_manager.clone();
+            match f(conn).await {
+                Ok(value) => return Ok(value),
+                Err(err)
+                    if attempt < REDIS_CONNECTION_RETRIES
+                        && Self::should_retry_connection_error(&err) =>
+                {
+                    attempt += 1;
+                    warn!(
+                        "Retrying Redis {} after connection error: {}",
+                        operation, err
+                    );
+                }
+                Err(err) => return Err(AppError::from(err)),
+            }
+        }
+    }
+
+    async fn save_once(
+        &self,
+        mut conn: ConnectionManager,
+        token: &str,
+        metadata: &FileMetadata,
+        ttl: StdDuration,
+    ) -> redis::RedisResult<()> {
+        let key = self.metadata_key(token);
+        let ttl_secs = ttl.as_secs();
+        let size = metadata.size.to_string();
+        let download_count = metadata.download_count.to_string();
+        let download_limit = metadata.download_limit.to_string();
+        let uploaded_at = metadata.uploaded_at.to_rfc3339();
+        let expires_at = metadata.expires_at.to_rfc3339();
+
+        redis::pipe()
+            .atomic()
+            .hset_multiple(
+                &key,
+                &[
+                    ("original_name", metadata.original_name.as_str()),
+                    ("storage_path", metadata.storage_path.as_str()),
+                    ("size", size.as_str()),
+                    ("extension", metadata.extension.as_str()),
+                    ("uploaded_at", uploaded_at.as_str()),
+                    ("expires_at", expires_at.as_str()),
+                    ("download_count", download_count.as_str()),
+                    ("download_limit", download_limit.as_str()),
+                ],
+            )
+            .expire(&key, ttl_secs as i64)
+            .zadd(Self::EXPIRY_SET_KEY, token, metadata.expires_at.timestamp())
+            .zadd(
+                Self::UPLOADED_SET_KEY,
+                token,
+                metadata.uploaded_at.timestamp(),
+            )
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
     fn parse_hash_metadata(
         token: &str,
         values: Vec<Option<String>>,
@@ -84,7 +167,7 @@ return new_count
             return Ok(None);
         }
 
-        if values.len() != 8 {
+        if values.len() != METADATA_FIELDS.len() {
             return Err(AppError::InternalServerError(
                 "invalid metadata hash field count".to_string(),
             ));
@@ -120,26 +203,20 @@ return new_count
         }))
     }
 
-    async fn load_metadata_from_hash(
-        &self,
-        conn: &mut ConnectionManager,
-        token: &str,
-    ) -> AppResult<Option<FileMetadata>> {
+    async fn load_metadata_from_hash(&self, token: &str) -> AppResult<Option<FileMetadata>> {
         let key = self.metadata_key(token);
-        let fields = [
-            "original_name",
-            "storage_path",
-            "size",
-            "extension",
-            "uploaded_at",
-            "expires_at",
-            "download_count",
-            "download_limit",
-        ];
 
-        let values: Vec<Option<String>> =
-            conn.hmget(&key, &fields).await.map_err(AppError::from)?;
+        let values: Vec<Option<String>> = self
+            .redis_retry("metadata load", |mut conn| {
+                let key = key.clone();
+                async move { conn.hmget(&key, &METADATA_FIELDS).await }
+            })
+            .await?;
         Self::parse_hash_metadata(token, values)
+    }
+
+    fn queue_metadata_hmget(&self, pipe: &mut redis::Pipeline, token: &str) {
+        pipe.hmget(self.metadata_key(token), &METADATA_FIELDS);
     }
 
     const EXPIRY_SET_KEY: &'static str = "file:expiry:set";
@@ -147,7 +224,6 @@ return new_count
 
     async fn list_files_by_uploaded_at(
         &self,
-        conn: &mut ConnectionManager,
         offset: usize,
         limit: usize,
         desc: bool,
@@ -167,15 +243,15 @@ return new_count
             let stop = isize::try_from(zset_index.saturating_add(chunk_size).saturating_sub(1))
                 .map_err(|_| AppError::BadRequest("page too large".to_string()))?;
 
-            let tokens: Vec<String> = if desc {
-                conn.zrevrange(Self::UPLOADED_SET_KEY, start, stop)
-                    .await
-                    .map_err(AppError::from)?
-            } else {
-                conn.zrange(Self::UPLOADED_SET_KEY, start, stop)
-                    .await
-                    .map_err(AppError::from)?
-            };
+            let tokens: Vec<String> = self
+                .redis_retry("uploaded set range", |mut conn| async move {
+                    if desc {
+                        conn.zrevrange(Self::UPLOADED_SET_KEY, start, stop).await
+                    } else {
+                        conn.zrange(Self::UPLOADED_SET_KEY, start, stop).await
+                    }
+                })
+                .await?;
 
             if tokens.is_empty() {
                 break;
@@ -183,25 +259,15 @@ return new_count
 
             let batch_len = tokens.len();
 
-            let mut pipe = redis::pipe();
-            for token in &tokens {
-                pipe.hmget(
-                    self.metadata_key(token),
-                    &[
-                        "original_name",
-                        "storage_path",
-                        "size",
-                        "extension",
-                        "uploaded_at",
-                        "expires_at",
-                        "download_count",
-                        "download_limit",
-                    ],
-                );
-            }
-
-            let results: Vec<Vec<Option<String>>> =
-                pipe.query_async(conn).await.map_err(AppError::from)?;
+            let results: Vec<Vec<Option<String>>> = self
+                .redis_retry("metadata batch load", |mut conn| {
+                    let mut pipe = redis::pipe();
+                    for token in &tokens {
+                        self.queue_metadata_hmget(&mut pipe, token);
+                    }
+                    async move { pipe.query_async(&mut conn).await }
+                })
+                .await?;
 
             let mut stale_tokens = Vec::new();
 
@@ -228,16 +294,16 @@ return new_count
             }
 
             if !stale_tokens.is_empty() {
-                let mut cleanup_pipe = redis::pipe();
-                cleanup_pipe.atomic();
-                for token in &stale_tokens {
-                    cleanup_pipe.zrem(Self::EXPIRY_SET_KEY, token);
-                    cleanup_pipe.zrem(Self::UPLOADED_SET_KEY, token);
-                }
-                cleanup_pipe
-                    .query_async::<()>(conn)
-                    .await
-                    .map_err(AppError::from)?;
+                self.redis_retry("stale uploaded-set cleanup", |mut conn| {
+                    let mut cleanup_pipe = redis::pipe();
+                    cleanup_pipe.atomic();
+                    for token in &stale_tokens {
+                        cleanup_pipe.zrem(Self::EXPIRY_SET_KEY, token);
+                        cleanup_pipe.zrem(Self::UPLOADED_SET_KEY, token);
+                    }
+                    async move { cleanup_pipe.query_async::<()>(&mut conn).await }
+                })
+                .await?;
             }
 
             zset_index = zset_index.saturating_add(batch_len);
@@ -250,48 +316,14 @@ return new_count
 #[async_trait::async_trait]
 impl MetadataStore for RedisStore {
     async fn save(&self, token: &str, metadata: FileMetadata, ttl: StdDuration) -> AppResult<()> {
-        let mut conn = self.conn_manager.clone();
-
-        let key = self.metadata_key(token);
-        let ttl_secs = ttl.as_secs();
-        let size = metadata.size.to_string();
-        let download_count = metadata.download_count.to_string();
-        let download_limit = metadata.download_limit.to_string();
-        let uploaded_at = metadata.uploaded_at.to_rfc3339();
-        let expires_at = metadata.expires_at.to_rfc3339();
-
-        redis::pipe()
-            .atomic()
-            .hset_multiple(
-                &key,
-                &[
-                    ("original_name", metadata.original_name.as_str()),
-                    ("storage_path", metadata.storage_path.as_str()),
-                    ("size", size.as_str()),
-                    ("extension", metadata.extension.as_str()),
-                    ("uploaded_at", uploaded_at.as_str()),
-                    ("expires_at", expires_at.as_str()),
-                    ("download_count", download_count.as_str()),
-                    ("download_limit", download_limit.as_str()),
-                ],
-            )
-            .expire(&key, ttl_secs as i64)
-            .zadd(Self::EXPIRY_SET_KEY, token, metadata.expires_at.timestamp())
-            .zadd(
-                Self::UPLOADED_SET_KEY,
-                token,
-                metadata.uploaded_at.timestamp(),
-            )
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(AppError::from)?;
-
-        Ok(())
+        self.redis_retry("metadata save", |conn| {
+            self.save_once(conn, token, &metadata, ttl)
+        })
+        .await
     }
 
     async fn load(&self, token: &str) -> AppResult<FileMetadata> {
-        let mut conn = self.conn_manager.clone();
-        self.load_metadata_from_hash(&mut conn, token)
+        self.load_metadata_from_hash(token)
             .await?
             .ok_or_else(|| AppError::NotFound("file not found".to_string()))
     }
@@ -320,53 +352,42 @@ impl MetadataStore for RedisStore {
     }
 
     async fn remove(&self, token: &str) -> AppResult<()> {
-        let mut conn = self.conn_manager.clone();
         let key = self.metadata_key(token);
 
-        redis::pipe()
-            .atomic()
-            .del(&key)
-            .zrem(Self::EXPIRY_SET_KEY, token)
-            .zrem(Self::UPLOADED_SET_KEY, token)
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(AppError::from)?;
-
-        Ok(())
+        self.redis_retry("metadata remove", |mut conn| {
+            let mut pipe = redis::pipe();
+            pipe.atomic()
+                .del(&key)
+                .zrem(Self::EXPIRY_SET_KEY, token)
+                .zrem(Self::UPLOADED_SET_KEY, token);
+            async move { pipe.query_async::<()>(&mut conn).await }
+        })
+        .await
     }
 
     async fn list_expired(&self, limit: usize) -> AppResult<(Vec<String>, Vec<FileMetadata>)> {
-        let mut conn = self.conn_manager.clone();
         let now = Utc::now().timestamp();
 
-        let tokens: Vec<String> = conn
-            .zrangebyscore_limit(Self::EXPIRY_SET_KEY, 0, now, 0, limit as isize)
-            .await
-            .map_err(AppError::from)?;
+        let tokens: Vec<String> = self
+            .redis_retry("expired set range", |mut conn| async move {
+                conn.zrangebyscore_limit(Self::EXPIRY_SET_KEY, 0, now, 0, limit as isize)
+                    .await
+            })
+            .await?;
 
         if tokens.is_empty() {
             return Ok((vec![], vec![]));
         }
 
-        let mut pipe = redis::pipe();
-        for token in &tokens {
-            pipe.hmget(
-                self.metadata_key(token),
-                &[
-                    "original_name",
-                    "storage_path",
-                    "size",
-                    "extension",
-                    "uploaded_at",
-                    "expires_at",
-                    "download_count",
-                    "download_limit",
-                ],
-            );
-        }
-
-        let results: Vec<Vec<Option<String>>> =
-            pipe.query_async(&mut conn).await.map_err(AppError::from)?;
+        let results: Vec<Vec<Option<String>>> = self
+            .redis_retry("expired metadata batch load", |mut conn| {
+                let mut pipe = redis::pipe();
+                for token in &tokens {
+                    self.queue_metadata_hmget(&mut pipe, token);
+                }
+                async move { pipe.query_async(&mut conn).await }
+            })
+            .await?;
 
         let mut valid_tokens = Vec::new();
         let mut metadata_list = Vec::new();
@@ -376,13 +397,14 @@ impl MetadataStore for RedisStore {
                 valid_tokens.push(token);
                 metadata_list.push(metadata);
             } else {
-                redis::pipe()
-                    .atomic()
-                    .zrem(Self::EXPIRY_SET_KEY, &token)
-                    .zrem(Self::UPLOADED_SET_KEY, &token)
-                    .query_async::<()>(&mut conn)
-                    .await
-                    .map_err(AppError::from)?;
+                self.redis_retry("stale expiry-set cleanup", |mut conn| {
+                    let mut pipe = redis::pipe();
+                    pipe.atomic()
+                        .zrem(Self::EXPIRY_SET_KEY, &token)
+                        .zrem(Self::UPLOADED_SET_KEY, &token);
+                    async move { pipe.query_async::<()>(&mut conn).await }
+                })
+                .await?;
             }
         }
 
@@ -396,22 +418,20 @@ impl MetadataStore for RedisStore {
         sort_by: &str,
         desc: bool,
     ) -> AppResult<(Vec<(String, FileMetadata)>, usize)> {
-        let mut conn = self.conn_manager.clone();
-
         if sort_by == "uploaded_at" {
-            let uploaded_count: i64 = conn
-                .zcard(Self::UPLOADED_SET_KEY)
-                .await
-                .map_err(AppError::from)?;
-            let expiry_count: i64 = conn
-                .zcard(Self::EXPIRY_SET_KEY)
-                .await
-                .map_err(AppError::from)?;
+            let uploaded_count: i64 = self
+                .redis_retry("uploaded set count", |mut conn| async move {
+                    conn.zcard(Self::UPLOADED_SET_KEY).await
+                })
+                .await?;
+            let expiry_count: i64 = self
+                .redis_retry("expiry set count", |mut conn| async move {
+                    conn.zcard(Self::EXPIRY_SET_KEY).await
+                })
+                .await?;
 
             if uploaded_count > 0 && uploaded_count == expiry_count {
-                return self
-                    .list_files_by_uploaded_at(&mut conn, offset, limit, desc)
-                    .await;
+                return self.list_files_by_uploaded_at(offset, limit, desc).await;
             }
         }
 
@@ -421,15 +441,21 @@ impl MetadataStore for RedisStore {
         let mut cursor = 0u64;
 
         loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(&pattern)
-                .arg("COUNT")
-                .arg(1000)
-                .query_async(&mut conn)
-                .await
-                .map_err(AppError::from)?;
+            let (next_cursor, keys): (u64, Vec<String>) = self
+                .redis_retry("metadata scan", |mut conn| {
+                    let pattern = pattern.clone();
+                    async move {
+                        redis::cmd("SCAN")
+                            .arg(cursor)
+                            .arg("MATCH")
+                            .arg(&pattern)
+                            .arg("COUNT")
+                            .arg(1000)
+                            .query_async(&mut conn)
+                            .await
+                    }
+                })
+                .await?;
 
             all_keys.extend(keys);
             cursor = next_cursor;
@@ -443,25 +469,15 @@ impl MetadataStore for RedisStore {
             return Ok((vec![], 0));
         }
 
-        let mut pipe = redis::pipe();
-        for key in &all_keys {
-            pipe.hmget(
-                key,
-                &[
-                    "original_name",
-                    "storage_path",
-                    "size",
-                    "extension",
-                    "uploaded_at",
-                    "expires_at",
-                    "download_count",
-                    "download_limit",
-                ],
-            );
-        }
-
-        let results: Vec<Vec<Option<String>>> =
-            pipe.query_async(&mut conn).await.map_err(AppError::from)?;
+        let results: Vec<Vec<Option<String>>> = self
+            .redis_retry("listed metadata batch load", |mut conn| {
+                let mut pipe = redis::pipe();
+                for key in &all_keys {
+                    pipe.hmget(key, &METADATA_FIELDS);
+                }
+                async move { pipe.query_async(&mut conn).await }
+            })
+            .await?;
 
         let mut all_files = Vec::new();
         let now = Utc::now();
@@ -473,13 +489,14 @@ impl MetadataStore for RedisStore {
                     all_files.push((token.to_string(), metadata));
                 }
             } else {
-                redis::pipe()
-                    .atomic()
-                    .zrem(Self::EXPIRY_SET_KEY, token)
-                    .zrem(Self::UPLOADED_SET_KEY, token)
-                    .query_async::<()>(&mut conn)
-                    .await
-                    .map_err(AppError::from)?;
+                self.redis_retry("stale listed-set cleanup", |mut conn| {
+                    let mut pipe = redis::pipe();
+                    pipe.atomic()
+                        .zrem(Self::EXPIRY_SET_KEY, token)
+                        .zrem(Self::UPLOADED_SET_KEY, token);
+                    async move { pipe.query_async::<()>(&mut conn).await }
+                })
+                .await?;
             }
         }
 

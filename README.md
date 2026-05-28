@@ -81,6 +81,8 @@ All configuration is done via environment variables:
 | `MAX_FILE_SIZE` | `268435456` | Max file size in bytes (256MB) |
 | `FILE_EXPIRATION` | `36h` | File expiration time (supports: `s`, `m`, `h`, `d`) |
 | `MAX_DOWNLOAD_COUNT` | `0` | Max downloads per file (0 = unlimited) |
+| `IMAGE_MAX_DOWNLOAD_COUNT` | `0` | Max downloads for image files (0 = unlimited) |
+| `PUBLIC_BASE_URL` | - | Public base URL used in returned links, e.g. `https://dl.example.com` |
 | `API_KEY` | - | Optional API key for authentication |
 | `REDIS_ADDR` | - | Redis server address (e.g., `redis:6379`) |
 | `REDIS_DB` | `0` | Redis database number |

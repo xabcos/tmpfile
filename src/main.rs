@@ -28,12 +28,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("File server starting on {}", config.listen_addr);
     info!(
-        "Configuration: MaxFileSize={}MB, FileExpiration={}h, CleanupInterval={}m, MaxDownloads={}",
+        "Configuration: MaxFileSize={}MB, FileExpiration={}h, CleanupInterval={}m, MaxDownloads={}, ImageMaxDownloads={}",
         config.max_file_size / (1024 * 1024),
         config.file_expiration.num_hours(),
         config.cleanup_interval.num_minutes(),
         if config.max_download_count > 0 {
             config.max_download_count.to_string()
+        } else {
+            "unlimited".to_string()
+        },
+        if config.image_max_download_count > 0 {
+            config.image_max_download_count.to_string()
         } else {
             "unlimited".to_string()
         }
