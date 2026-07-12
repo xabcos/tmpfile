@@ -7,7 +7,7 @@ use crate::models::FileMetadata;
 use chrono::{DateTime, Utc};
 use redis::{AsyncCommands, Client, Script, aio::ConnectionManager};
 use std::future::Future;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub struct RedisStore {
     conn_manager: ConnectionManager,
@@ -70,7 +70,6 @@ impl RedisStore {
             .await
             .map_err(|e| AppError::InternalServerError(format!("Redis ping failed: {e}")))?;
 
-        info!("Redis connection established");
         let claim_download_script = Script::new(
             r"
 local key = KEYS[1]

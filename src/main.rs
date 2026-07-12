@@ -35,7 +35,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::from_env()?;
 
-    info!("File server starting on {}", config.listen_addr);
     info!(
         "Configuration: MaxFileSize={}MiB, FileExpiration={}, CleanupInterval={}, MaxDownloads={}, ImageMaxDownloads={}",
         config.max_file_size / (1024 * 1024),
