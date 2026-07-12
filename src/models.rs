@@ -11,7 +11,6 @@ where
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
     pub original_name: String,
-    pub storage_path: String,
     pub size: i64,
     pub extension: String,
     pub uploaded_at: DateTime<Utc>,

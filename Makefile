@@ -2,6 +2,8 @@ APP=tmpfile
 IMAGE=proxyxai/tmpfile
 VERSION?=rust
 SANITIZED_VERSION:=$(subst :,-,$(VERSION))
+TOOLCHAIN?=stable
+CARGO:=cargo +$(TOOLCHAIN)
 CLIPPY_ENV:=
 FEATURE_ARGS:=--all-features
 
@@ -85,42 +87,42 @@ CLIPPY_CI_FLAGS = \
 # ============================================================
 
 build:
-	cargo build --release
+	$(CARGO) build --locked --release
 
 run:
-	cargo run
+	$(CARGO) run --locked
 
 clean:
-	cargo clean
+	$(CARGO) clean
 
 check:
-	cargo check
+	$(CARGO) check --locked --all-targets $(FEATURE_ARGS)
 
 fmt:
-	cargo fmt --all
+	$(CARGO) fmt --all
 
 fmt-check:
-	cargo fmt --all -- --check
+	$(CARGO) fmt --all -- --check
 
 test:
-	cargo test $(FEATURE_ARGS)
+	$(CARGO) test --locked --all-targets $(FEATURE_ARGS)
 
 # ============================================================
 #  Lint
 # ============================================================
 
 clippy:
-	$(CLIPPY_ENV) cargo clippy --all-targets $(FEATURE_ARGS) \
+	$(CLIPPY_ENV) $(CARGO) clippy --locked --all-targets $(FEATURE_ARGS) \
 		--message-format short -- $(CLIPPY_DEV_FLAGS)
 
 clippy-ci:
-	$(CLIPPY_ENV) cargo clippy --all-targets $(FEATURE_ARGS) \
+	$(CLIPPY_ENV) $(CARGO) clippy --locked --all-targets $(FEATURE_ARGS) \
 		--message-format short -- $(CLIPPY_CI_FLAGS)
 
-lint: fmt clippy
+lint: fmt-check clippy
 
 audit:
-	cargo audit
+	$(CARGO) audit
 
 # ============================================================
 #  Release Gate
@@ -137,11 +139,11 @@ release-check: fmt-check test clippy-ci audit
 # ============================================================
 
 docker-build:
-	docker build -t $(IMAGE):$(SANITIZED_VERSION) .
+	docker build --pull -t $(IMAGE):$(SANITIZED_VERSION) .
 	docker push $(IMAGE):$(SANITIZED_VERSION)
 
 docker-test:
-	docker build -t $(IMAGE):$(SANITIZED_VERSION)-test .
+	docker build --pull -t $(IMAGE):$(SANITIZED_VERSION)-test .
 	docker push $(IMAGE):$(SANITIZED_VERSION)-test
 
 docker-run:

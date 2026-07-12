@@ -9,14 +9,23 @@ use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
 };
-use config::ServerConfig;
-use std::sync::Arc;
+use config::{MULTIPART_OVERHEAD_BYTES, ServerConfig, format_duration};
+use std::{process::ExitCode, sync::Arc};
 use storage::FileServer;
-use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("tmpfile: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -24,14 +33,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config = ServerConfig::from_env();
+    let config = ServerConfig::from_env()?;
 
     info!("File server starting on {}", config.listen_addr);
     info!(
-        "Configuration: MaxFileSize={}MB, FileExpiration={}h, CleanupInterval={}m, MaxDownloads={}, ImageMaxDownloads={}",
+        "Configuration: MaxFileSize={}MiB, FileExpiration={}, CleanupInterval={}, MaxDownloads={}, ImageMaxDownloads={}",
         config.max_file_size / (1024 * 1024),
-        config.file_expiration.num_hours(),
-        config.cleanup_interval.num_minutes(),
+        format_duration(config.file_expiration),
+        format_duration(config.cleanup_interval),
         if config.max_download_count > 0 {
             config.max_download_count.to_string()
         } else {
@@ -57,19 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let cleanup_server = server.clone();
-    tokio::spawn(async move {
+    std::mem::drop(tokio::spawn(async move {
         FileServer::cleanup_worker(cleanup_server).await;
-    });
+    }));
 
-    let max_body_size = config.max_file_size.min(usize::MAX as u64) as usize;
-
-    let app = Router::new()
-        .route("/upload", post(handlers::handle_upload))
-        .route("/files/{path}", get(handlers::handle_download))
-        .route("/list", get(handlers::handle_list_files))
-        .layer(DefaultBodyLimit::max(max_body_size))
-        .layer(RequestBodyLimitLayer::new(max_body_size))
-        .with_state(server);
+    let app = build_app(server);
 
     let addr: std::net::SocketAddr = config.listen_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -79,3 +80,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+fn build_app(server: Arc<FileServer>) -> Router {
+    let max_file_size = usize::try_from(server.config.max_file_size).unwrap_or(usize::MAX);
+    let max_body_size = max_file_size.saturating_add(MULTIPART_OVERHEAD_BYTES);
+
+    Router::new()
+        .route("/upload", post(handlers::handle_upload))
+        .route("/files/{path}", get(handlers::handle_download))
+        .route("/list", get(handlers::handle_list_files))
+        // Multipart headers and boundaries count toward the request size. File
+        // content is still checked precisely while it is streamed to disk.
+        .layer(DefaultBodyLimit::max(max_body_size))
+        .with_state(server)
+}
+
+#[cfg(test)]
+mod http_tests;
