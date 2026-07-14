@@ -1,1 +1,6 @@
-/target
+/api/target/
+/api/uploads/
+/uploads/
+/.env
+/.wrangler/
+*.log

@@ -11,6 +11,11 @@ use tower::ServiceExt;
 
 const BOUNDARY: &str = "tmpfile-test-boundary";
 
+fn upload_contract() -> Value {
+    serde_json::from_str(include_str!("../contracts/upload.json"))
+        .expect("upload contract fixture must be valid JSON")
+}
+
 fn test_config(upload_dir: &Path, max_file_size: u64, api_key: Option<&str>) -> ServerConfig {
     ServerConfig {
         listen_addr: "127.0.0.1:0".to_string(),
@@ -46,8 +51,10 @@ async fn test_app_with_download_limit(
 }
 
 fn multipart(filename: &str, contents: &[u8], complete: bool) -> Vec<u8> {
+    let contract = upload_contract();
+    let field = contract["multipart_field"].as_str().unwrap();
     let mut body = format!(
-        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
     )
     .into_bytes();
     body.extend_from_slice(contents);
@@ -58,9 +65,10 @@ fn multipart(filename: &str, contents: &[u8], complete: bool) -> Vec<u8> {
 }
 
 fn upload_request(filename: &str, contents: &[u8], api_key: Option<&str>) -> Request<Body> {
+    let contract = upload_contract();
     let mut builder = Request::builder()
-        .method("POST")
-        .uri("/upload")
+        .method(contract["method"].as_str().unwrap())
+        .uri(contract["path"].as_str().unwrap())
         .header(header::HOST, "ignored.example.test")
         .header(
             header::CONTENT_TYPE,
@@ -109,6 +117,13 @@ async fn upload_download_and_list_cover_the_http_contract_and_boundaries() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let upload = response_json(response).await;
+    for field in upload_contract()["required_response_fields"]
+        .as_array()
+        .unwrap()
+    {
+        let field = field.as_str().unwrap();
+        assert!(upload.get(field).is_some(), "missing upload field {field}");
+    }
     assert_eq!(upload["size"], 5);
     assert_eq!(upload["expires_in"], "90m");
     assert_eq!(upload["token"].as_str().unwrap().len(), 25);
@@ -142,6 +157,10 @@ async fn upload_download_and_list_cover_the_http_contract_and_boundaries() {
         "text/plain; charset=utf-8"
     );
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, no-store"
+    );
     assert!(response.headers().get(header::ACCEPT_RANGES).is_none());
     let disposition = response.headers()[header::CONTENT_DISPOSITION]
         .to_str()
@@ -242,6 +261,10 @@ async fn head_does_not_consume_the_download_limit() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_LENGTH], "5");
     assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    assert_eq!(
         response.headers()[header::CONTENT_TYPE],
         "text/plain; charset=utf-8"
     );
@@ -287,4 +310,29 @@ async fn incomplete_upload_is_removed_and_listing_is_disabled_without_an_api_key
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn options_is_intentionally_left_to_the_reverse_proxy() {
+    let (app, _server, _upload_dir) = test_app(1024, None).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/upload")
+                .header(header::ORIGIN, "https://pages.example.test")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
 }

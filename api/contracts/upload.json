@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "path": "/upload",
+  "multipart_field": "file",
+  "required_response_fields": [
+    "direct_link",
+    "filename",
+    "size",
+    "expires_at"
+  ]
+}

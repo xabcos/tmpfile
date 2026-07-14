@@ -1,0 +1,37 @@
+name: Pages Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'pages/**'
+      - 'api/contracts/**'
+      - 'scripts/check-pages.mjs'
+      - 'Makefile'
+      - '.github/workflows/pages.yml'
+  pull_request:
+    paths:
+      - 'pages/**'
+      - 'api/contracts/**'
+      - 'scripts/check-pages.mjs'
+      - 'Makefile'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Validate static Pages bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Check Node runtime
+        run: node --version
+
+      - name: Validate Pages assets and API contract
+        run: make pages-check

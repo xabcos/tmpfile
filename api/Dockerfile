@@ -2,7 +2,13 @@
 FROM rust:bookworm AS builder
 WORKDIR /app
 
-COPY . .
+COPY api/Cargo.toml api/Cargo.lock ./
+COPY api/src/main.rs ./src/main.rs
+COPY api/contracts ./contracts
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo fetch --locked
+
+COPY api/src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     cargo test --locked --all-targets --all-features \

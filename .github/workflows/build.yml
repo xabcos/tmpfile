@@ -4,18 +4,36 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - '**.md'
+    paths:
+      - 'api/**'
+      - '.dockerignore'
+      - 'Makefile'
+      - '.github/workflows/build.yml'
   pull_request:
+    paths:
+      - 'api/**'
+      - '.dockerignore'
+      - 'Makefile'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 env:
   TZ: Asia/Shanghai
 
+permissions:
+  contents: read
+
+concurrency:
+  group: tmpfile-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   quality:
     name: Format, lint, and test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     services:
       redis:
         image: redis:7-alpine
@@ -37,19 +55,36 @@ jobs:
         rustc +stable --version
         cargo +stable --version
 
+    - name: Install nginx for deployment checks
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes nginx
+
     - name: Check formatting
-      run: cargo +stable fmt --all -- --check
+      run: make fmt-check
 
     - name: Run tests
-      run: cargo +stable test --locked --all-targets --all-features
+      run: make test
 
     - name: Run Redis contract test
       env:
         TEST_REDIS_ADDR: 127.0.0.1:6379
-      run: cargo +stable test --locked redis_store_contract -- --ignored
+      run: cd api && cargo +stable test --locked redis_store_contract -- --ignored
 
     - name: Run Clippy
-      run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
+      run: make clippy-ci
+
+    - name: Validate Pages/API surface contract
+      run: make pages-check
+
+    - name: Validate nginx syntax and CORS behavior
+      run: make nginx-check
+
+    - name: Audit Rust dependencies
+      uses: rustsec/audit-check@v2.0.0
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: api
 
   build:
     name: Build Job
@@ -80,6 +115,7 @@ jobs:
       uses: docker/build-push-action@v7.3.0
       with:
         context: .
+        file: ./api/Dockerfile
         pull: true
         push: true
         platforms: linux/amd64
@@ -94,6 +130,14 @@ jobs:
     if: github.ref == 'refs/heads/main'
 
     steps:
+    - name: Checkout deployment checks
+      uses: actions/checkout@v7.0.0
+
+    - name: Verify production nginx CORS is active
+      env:
+        TMPFILE_PAGES_ORIGIN: ${{ vars.TMPFILE_PAGES_ORIGIN }}
+      run: ./scripts/check-production-cors.sh https://dl.xabclabs.com/upload "$TMPFILE_PAGES_ORIGIN"
+
     - name: Get repo name
       run: echo "REPO_NAME=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_ENV"
 
@@ -104,8 +148,9 @@ jobs:
         username: ywgx
         key: ${{ secrets.PROD_KEY }}
         script: |
+          set -e
           cd /home/${{ secrets.DOCKER_HUB_USERNAME }}/1/${{ env.REPO_NAME }}
-          docker-compose down
+          docker-compose -f docker-compose.yml pull
           docker-compose -f docker-compose.yml up -d
           docker image prune --all --force
           docker system prune -a -f

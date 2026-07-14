@@ -282,6 +282,13 @@ pub async fn handle_download(
         header::HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
+    // Token URLs have expiration and download-count semantics. Explicitly
+    // prevent browsers and reverse proxies from serving a cached response
+    // without consulting the API.
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
 
     if method == Method::HEAD {
         return Ok((headers, Body::empty()));

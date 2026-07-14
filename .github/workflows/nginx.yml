@@ -1,0 +1,39 @@
+name: Nginx Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'deploy/nginx/**'
+      - 'scripts/check-nginx.sh'
+      - 'scripts/check-production-cors.sh'
+      - 'Makefile'
+      - '.github/workflows/nginx.yml'
+  pull_request:
+    paths:
+      - 'deploy/nginx/**'
+      - 'scripts/check-nginx.sh'
+      - 'scripts/check-production-cors.sh'
+      - 'Makefile'
+      - '.github/workflows/nginx.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Validate nginx syntax and CORS behavior
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Install nginx
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nginx
+
+      - name: Validate nginx edge policy
+        run: make nginx-check

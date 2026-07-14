@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>𝒕𝒎𝒑𝒇𝒊𝒍𝒆</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<script src="/config.js"></script>
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #f5f5f5;
+  color: #333;
+  line-height: 1.6;
+  padding: 1rem;
+}
+
+.container {
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+/* Config */
+.config {
+  display: none;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.config.show {
+  display: grid;
+}
+
+.config-toggle {
+  display: block;
+  margin: 0 0 0.5rem auto;
+}
+
+input[type="text"], input[type="password"] {
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+/* Drop zone */
+.drop-zone {
+  border: 2px dashed #ddd;
+  border-radius: 8px;
+  padding: 5rem 3rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s;
+  background: #fff;
+  margin-bottom: 1rem;
+}
+
+.drop-zone:hover, .drop-zone.dragover {
+  border-color: #666;
+  background: #fafafa;
+}
+
+.drop-zone h3 {
+  font-size: 1.2rem;
+  font-weight: 500;
+  margin-bottom: 0.5rem;
+}
+
+input[type="file"] {
+  display: none;
+}
+
+/* 上传队列 */
+.upload-queue {
+  display: none;
+  margin-bottom: 1rem;
+}
+
+.upload-queue.show {
+  display: block;
+}
+
+.file-item, .history-item {
+  background: #fff;
+  border-radius: 4px;
+  padding: 0.75rem;
+  margin-bottom: 0.5rem;
+  font-size: 13px;
+}
+
+.file-item-header, .history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.file-item-name, .file-name {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 1rem;
+}
+
+.file-item-size, .file-meta {
+  color: #999;
+  font-size: 12px;
+}
+
+.file-item-status {
+  font-size: 12px;
+  margin-top: 0.25rem;
+  color: #999;
+}
+
+.file-item-status.uploading { color: #2196f3; }
+.file-item-status.success { color: #4caf50; }
+.file-item-status.error { color: #f44336; }
+
+.file-progress {
+  height: 2px;
+  background: #eee;
+  margin-top: 0.5rem;
+  border-radius: 1px;
+  overflow: hidden;
+}
+
+.file-progress-bar {
+  height: 100%;
+  background: #2196f3;
+  transition: width 0.3s;
+}
+
+.file-link {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.file-link input {
+  flex: 1;
+  padding: 0.3rem 0.5rem;
+  background: #f5f5f5;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+/* Buttons */
+button {
+  cursor: pointer;
+}
+
+.btn-sm {
+  padding: 0.3rem 0.8rem;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.btn-dark {
+  background: #333;
+  color: #fff;
+  border: none;
+}
+
+.btn-text {
+  background: none;
+  border: none;
+  color: #666;
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+.btn-outline {
+  padding: 0.25rem 0.5rem;
+  font-size: 11px;
+  border: 1px solid #e0e0e0;
+  background: #fff;
+  border-radius: 4px;
+}
+
+.btn-outline:hover {
+  background: #f5f5f5;
+}
+
+.copied {
+  background: #4caf50 !important;
+  color: #fff !important;
+  border-color: #4caf50 !important;
+}
+
+/* History */
+.history {
+  background: #fff;
+  border-radius: 8px;
+  padding: 1rem;
+  display: none;
+}
+
+.history.show {
+  display: block;
+}
+
+.history-header {
+  margin-bottom: 0.75rem;
+}
+
+.history-header h3 {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.history-controls {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.history-item {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #f5f5f5;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: transparent;
+  margin-bottom: 0;
+  content-visibility: auto;
+  contain-intrinsic-size: 49px;
+}
+
+.history-item:last-child {
+  border-bottom: none;
+}
+
+.file-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.file-meta {
+  margin-top: 0.125rem;
+  font-size: 11px;
+}
+
+.history-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.remove-btn {
+  color: #999;
+  font-weight: bold;
+  padding: 0.25rem 0.5rem !important;
+}
+
+.remove-btn:hover {
+  color: #f44336;
+  background: #ffebee !important;
+  border-color: #ffcdd2 !important;
+}
+
+.error {
+  color: #f44336;
+  font-size: 12px;
+  margin-bottom: 0.5rem;
+  display: none;
+}
+</style>
+<!-- X-STATS 访问统计 -->
+<script>
+window.addEventListener('load', () => {
+  let referer = 'Direct';
+  try {
+    if (document.referrer) referer = new URL(document.referrer).origin;
+  } catch {}
+  fetch('https://api.xabcstack.com/x-urls/pk-XvslQZdpHzWMZM9wYMeYZ9AEJTLTO/track', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      url: `${location.origin}${location.pathname}`,
+      referer
+    }),
+    keepalive: true
+  }).catch(() => {});
+}, {once: true});
+</script>
+</head>
+<body>
+<div class="container">
+  <button type="button" class="btn-text config-toggle" id="configToggle" aria-controls="config">Settings</button>
+  <div class="config" id="config">
+    <input type="text" id="serverUrl" placeholder="Server URL">
+    <input type="password" id="apiKey" placeholder="API Key (optional)">
+  </div>
+
+  <div class="drop-zone" id="dropZone" role="button" tabindex="0" aria-label="Select files to upload"></div>
+
+  <input type="file" id="fileInput" multiple>
+
+  <div class="error" id="error"></div>
+
+  <div class="upload-queue" id="uploadQueue">
+    <div id="fileList"></div>
+  </div>
+
+  <div class="history" id="history">
+    <div class="history-header">
+      <h3>History</h3>
+      <div class="history-controls">
+        <button type="button" class="btn-text" id="copyAllBtn">Copy</button>
+        <button type="button" class="btn-text" id="clearBtn">Clear</button>
+      </div>
+    </div>
+    <div id="historyList"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const MAX_CONCURRENT_UPLOADS = 3;
+const MAX_HISTORY_ITEMS = 512;
+const HISTORY_KEY = 'uploadHistory';
+const DEFAULT_SERVER_URL = typeof window.TMPFILE_CONFIG?.serverUrl === 'string'
+  ? window.TMPFILE_CONFIG.serverUrl.trim().replace(/\/+$/, '')
+  : '';
+
+const els = {
+  config: $('config'),
+  configToggle: $('configToggle'),
+  serverUrl: $('serverUrl'),
+  apiKey: $('apiKey'),
+  dropZone: $('dropZone'),
+  fileInput: $('fileInput'),
+  error: $('error'),
+  uploadQueue: $('uploadQueue'),
+  fileList: $('fileList'),
+  history: $('history'),
+  historyList: $('historyList'),
+  copyAllBtn: $('copyAllBtn'),
+  clearBtn: $('clearBtn')
+};
+
+const storage = {
+  get(key) {
+    try {
+      const backend = key === 'apiKey' ? sessionStorage : localStorage;
+      return backend.getItem(key) || '';
+    } catch { return ''; }
+  },
+  set(key, value) {
+    try {
+      const backend = key === 'apiKey' ? sessionStorage : localStorage;
+      backend.setItem(key, value);
+    } catch { showError('Unable to save local data'); }
+  },
+  remove(key) {
+    try {
+      const backend = key === 'apiKey' ? sessionStorage : localStorage;
+      backend.removeItem(key);
+    } catch {}
+  }
+};
+
+// Older versions persisted the Bearer key indefinitely. Remove that legacy
+// copy; API keys now live only for the current browser tab.
+try { localStorage.removeItem('apiKey'); } catch {}
+
+const normalizeDirectLink = (value, serverUrl) => {
+  try {
+    const url = new URL(value);
+    const server = new URL(serverUrl);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    if (url.protocol === 'http:' &&
+        (url.hostname === 'dl.xabclabs.com' || server.protocol === 'https:' && server.host === url.host)) {
+      url.protocol = 'https:';
+    }
+    return url.href;
+  } catch {
+    return '';
+  }
+};
+
+const readHistory = () => {
+  try {
+    const parsed = JSON.parse(storage.get(HISTORY_KEY) || '[]');
+    if (Array.isArray(parsed)) return parsed.slice(0, MAX_HISTORY_ITEMS);
+  } catch {}
+
+  storage.remove(HISTORY_KEY);
+  return [];
+};
+
+let uploadHistory = readHistory();
+const uploadQueue = [];
+const queueItemEls = new Map();
+const activeQueueStatuses = new Set(['uploading', 'pending', 'error']);
+let renderQueuePending = false;
+let renderHistoryPending = false;
+let activeUploads = 0;
+let errorTimer;
+const copyTimers = new WeakMap();
+
+const saveHistory = () => storage.set(HISTORY_KEY, JSON.stringify(uploadHistory));
+
+// Check config
+const checkConfig = () => {
+  const apiKey = storage.get('apiKey');
+  const serverUrl = storage.get('serverUrl');
+
+  els.config.classList.toggle('show', !apiKey);
+  els.serverUrl.value = serverUrl || DEFAULT_SERVER_URL;
+  if (apiKey) els.apiKey.value = apiKey;
+  updateConfigToggle();
+};
+
+const updateConfigToggle = () => {
+  const visible = els.config.classList.contains('show');
+  els.configToggle.textContent = visible ? 'Hide settings' : 'Settings';
+  els.configToggle.setAttribute('aria-expanded', String(visible));
+};
+
+const formatBytes = bytes => {
+  bytes = Number(bytes);
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  if (bytes === 0) return '0 B';
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1);
+  return `${parseFloat((bytes / 1024 ** i).toFixed(1))} ${sizes[i]}`;
+};
+
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric', month: 'numeric', day: 'numeric',
+  hour: '2-digit', minute: '2-digit'
+});
+
+const formatDateTime = date => {
+  const d = new Date(date);
+  return Number.isNaN(d.getTime()) ? '-' : dateTimeFormatter.format(d);
+};
+
+const htmlEscapes = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;'
+};
+
+const escapeHtml = value => String(value).replace(/[&<>"']/g, char => htmlEscapes[char]);
+
+const getStatusText = (item, progress = item.progress) => {
+  if (item.status === 'pending') return 'Waiting...';
+  if (item.status === 'uploading') return `Uploading... ${Math.round(progress)}%`;
+  if (item.status === 'success') return 'Done';
+  return `Error: ${item.error}`;
+};
+
+const showError = msg => {
+  clearTimeout(errorTimer);
+  els.error.textContent = msg;
+  els.error.style.display = 'block';
+  errorTimer = setTimeout(() => els.error.style.display = 'none', 3000);
+};
+
+const copyToClipboard = async text => {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {}
+  }
+
+  const input = document.createElement('textarea');
+  input.value = text;
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  document.body.appendChild(input);
+  input.select();
+  const copied = document.execCommand('copy');
+  input.remove();
+  if (!copied) throw new Error('Copy failed');
+};
+
+const handleCopyButton = async (button, text) => {
+  try {
+    await copyToClipboard(text);
+    clearTimeout(copyTimers.get(button));
+    const originalText = button.dataset.originalText || button.textContent;
+    button.dataset.originalText = originalText;
+    button.textContent = '✓';
+    button.classList.add('copied');
+    copyTimers.set(button, setTimeout(() => {
+      button.textContent = originalText;
+      button.classList.remove('copied');
+      delete button.dataset.originalText;
+      copyTimers.delete(button);
+    }, 1500));
+  } catch {
+    showError('Unable to copy link');
+  }
+};
+
+const cleanHistory = () => {
+  const now = Date.now();
+  const validItems = uploadHistory.filter(item => Date.parse(item.expires) > now);
+  if (validItems.length === uploadHistory.length) return;
+  uploadHistory = validItems;
+  saveHistory();
+};
+
+const scheduleRenderQueue = () => {
+  if (renderQueuePending) return;
+  renderQueuePending = true;
+  requestAnimationFrame(() => {
+    renderQueuePending = false;
+    renderQueue();
+  });
+};
+
+const scheduleRenderHistory = () => {
+  if (renderHistoryPending) return;
+  renderHistoryPending = true;
+  requestAnimationFrame(() => {
+    renderHistoryPending = false;
+    renderHistory();
+  });
+};
+
+const addToQueue = files => {
+  const serverUrl = els.serverUrl.value.trim().replace(/\/+$/, '');
+  const apiKey = els.apiKey.value.trim();
+  for (const file of files) {
+    uploadQueue.push({
+      id: Date.now() + Math.random(),
+      file,
+      serverUrl,
+      apiKey,
+      status: 'pending',
+      progress: 0
+    });
+  }
+  scheduleRenderQueue();
+  processQueue();
+};
+
+const createQueueElement = item => {
+  const el = document.createElement('div');
+  el.className = 'file-item';
+  el.innerHTML = `
+    <div class="file-item-header">
+      <div class="file-item-name"></div>
+      <div class="file-item-size"></div>
+    </div>
+    <div class="file-item-status"></div>
+    <div class="file-progress"><div class="file-progress-bar"></div></div>`;
+  el.querySelector('.file-item-name').textContent = item.file.name;
+  el.querySelector('.file-item-size').textContent = formatBytes(item.file.size);
+  el.refs = {
+    status: el.querySelector('.file-item-status'),
+    progress: el.querySelector('.file-progress-bar'),
+    link: null
+  };
+  queueItemEls.set(item.id, el);
+  els.fileList.appendChild(el);
+  return el;
+};
+
+const updateQueueElement = item => {
+  const el = queueItemEls.get(item.id) || createQueueElement(item);
+  const progress = Math.max(0, Math.min(100, item.progress || 0));
+  el.refs.status.className = `file-item-status ${item.status}`;
+  el.refs.status.textContent = getStatusText(item, progress);
+  el.refs.progress.style.width = `${progress}%`;
+
+  if (item.status === 'success' && item.link && !el.refs.link) {
+    const link = document.createElement('div');
+    link.className = 'file-link';
+    link.innerHTML = '<input type="text" readonly><button type="button" class="btn-sm btn-dark">Copy</button>';
+    link.querySelector('input').value = item.link;
+    link.querySelector('button').dataset.copy = item.link;
+    el.refs.link = link;
+    el.appendChild(link);
+  }
+};
+
+const renderQueue = () => {
+  const now = Date.now();
+  const activeItems = uploadQueue.filter(
+    item => activeQueueStatuses.has(item.status) ||
+    (item.status === 'success' && now - item.completedAt < 5000)
+  );
+
+  els.uploadQueue.classList.toggle('show', activeItems.length > 0);
+  if (!activeItems.length) {
+    els.fileList.replaceChildren();
+    queueItemEls.clear();
+    return;
+  }
+
+  const activeIds = new Set(activeItems.map(item => item.id));
+  for (const [id, el] of queueItemEls) {
+    if (!activeIds.has(id)) {
+      el.remove();
+      queueItemEls.delete(id);
+    }
+  }
+
+  activeItems.forEach(updateQueueElement);
+};
+
+const uploadFile = async (queueItem) => {
+  const {serverUrl, apiKey} = queueItem;
+  if (!serverUrl) {
+    Object.assign(queueItem, {status: 'error', error: 'Server URL required'});
+    scheduleRenderQueue();
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('file', queueItem.file);
+
+  queueItem.status = 'uploading';
+  scheduleRenderQueue();
+
+  try {
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) {
+        queueItem.progress = e.loaded / e.total * 100;
+        scheduleRenderQueue();
+      }
+    };
+
+    const response = await new Promise((resolve, reject) => {
+      xhr.onload = () => {
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error(xhr.responseText || `HTTP ${xhr.status}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          reject(new Error('Invalid server response'));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Network error'));
+      xhr.ontimeout = () => reject(new Error('Upload timed out'));
+      xhr.onabort = () => reject(new Error('Upload cancelled'));
+
+      xhr.open('POST', `${serverUrl}/upload`);
+      xhr.timeout = 10 * 60 * 1000;
+      if (apiKey) xhr.setRequestHeader('Authorization', `Bearer ${apiKey}`);
+      xhr.send(formData);
+    });
+
+    if (!response.direct_link) throw new Error('Missing download link');
+    const directLink = normalizeDirectLink(response.direct_link, serverUrl);
+    if (!directLink) throw new Error('Invalid download link');
+
+    Object.assign(queueItem, {
+      status: 'success',
+      progress: 100,
+      link: directLink,
+      completedAt: Date.now()
+    });
+    scheduleRenderQueue();
+
+    uploadHistory.unshift({
+      filename: response.filename || queueItem.file.name,
+      link: directLink,
+      size: response.size ?? queueItem.file.size,
+      time: new Date().toISOString(),
+      expires: response.expires_at
+    });
+    uploadHistory = uploadHistory.slice(0, MAX_HISTORY_ITEMS);
+    saveHistory();
+    scheduleRenderHistory();
+
+    setTimeout(() => {
+      const index = uploadQueue.indexOf(queueItem);
+      if (index !== -1 && queueItem.status === 'success') uploadQueue.splice(index, 1);
+      scheduleRenderQueue();
+    }, 5000);
+
+  } catch (err) {
+    Object.assign(queueItem, {status: 'error', error: err.message});
+    scheduleRenderQueue();
+  }
+};
+
+const processQueue = () => {
+  while (activeUploads < MAX_CONCURRENT_UPLOADS) {
+    const nextItem = uploadQueue.find(item => item.status === 'pending');
+    if (!nextItem) return;
+    activeUploads++;
+    uploadFile(nextItem).finally(() => {
+      activeUploads--;
+      processQueue();
+    });
+  }
+};
+
+const renderHistory = () => {
+  cleanHistory();
+
+  els.history.classList.toggle('show', uploadHistory.length > 0);
+  if (!uploadHistory.length) {
+    els.historyList.innerHTML = '';
+    return;
+  }
+
+  els.historyList.innerHTML = uploadHistory.map((item, i) => `
+    <div class="history-item">
+      <div class="file-info">
+    <div class="file-name">${escapeHtml(item.filename)}</div>
+    <div class="file-meta">${formatBytes(item.size)} · ${formatDateTime(item.time)} → ${formatDateTime(item.expires)}</div>
+      </div>
+      <div class="history-actions">
+        <button type="button" class="btn-outline" data-copy="${escapeHtml(item.link)}">Copy</button>
+        <button type="button" class="btn-outline remove-btn" data-remove="${i}" aria-label="Remove ${escapeHtml(item.filename)}">×</button>
+      </div>
+    </div>
+  `).join('');
+};
+
+const handleListAction = async e => {
+  const target = e.target.closest && e.target.closest('[data-copy], [data-remove]');
+  if (!target) return;
+
+  if (target.dataset.copy !== undefined) {
+    await handleCopyButton(target, target.dataset.copy);
+  } else if (target.dataset.remove !== undefined) {
+    const index = Number(target.dataset.remove);
+    if (!Number.isInteger(index) || !uploadHistory[index]) return;
+    uploadHistory.splice(index, 1);
+    saveHistory();
+    renderHistory();
+  }
+};
+
+els.fileList.addEventListener('click', handleListAction);
+els.historyList.addEventListener('click', handleListAction);
+
+els.configToggle.addEventListener('click', () => {
+  els.config.classList.toggle('show');
+  updateConfigToggle();
+});
+
+els.dropZone.addEventListener('click', () => els.fileInput.click());
+els.dropZone.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    els.fileInput.click();
+  }
+});
+
+els.fileInput.addEventListener('change', e => {
+  if (e.target.files.length) {
+    addToQueue(e.target.files);
+    e.target.value = '';
+  }
+});
+
+['dragover', 'dragleave', 'drop'].forEach(event => {
+  els.dropZone.addEventListener(event, e => {
+    e.preventDefault();
+    els.dropZone.classList.toggle('dragover', event === 'dragover');
+    if (event === 'drop' && e.dataTransfer.files.length) {
+      addToQueue(e.dataTransfer.files);
+    }
+  });
+});
+
+els.copyAllBtn.addEventListener('click', async () => {
+  if (!uploadHistory.length) {
+    showError('No links to copy');
+    return;
+  }
+  await handleCopyButton(els.copyAllBtn, uploadHistory.map(item => item.link).join('\n'));
+});
+
+els.clearBtn.addEventListener('click', () => {
+  uploadHistory = [];
+  storage.remove(HISTORY_KEY);
+  renderHistory();
+});
+
+['serverUrl', 'apiKey'].forEach(key => {
+  els[key].addEventListener('change', e => {
+    const value = e.target.value.trim();
+    e.target.value = value;
+    storage.set(key, value);
+    if (key === 'apiKey' && els.serverUrl.value) {
+      storage.set('serverUrl', els.serverUrl.value.trim());
+    }
+    checkConfig();
+  });
+});
+
+checkConfig();
+renderHistory();
+</script>
+</body>
+</html>

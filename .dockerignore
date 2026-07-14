@@ -1,4 +1,9 @@
-target/
-.git/
-uploads/
-*.log
+**
+!api/
+!api/Cargo.toml
+!api/Cargo.lock
+!api/Dockerfile
+!api/contracts/
+!api/contracts/**
+!api/src/
+!api/src/**

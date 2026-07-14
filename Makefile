@@ -7,9 +7,9 @@ CARGO:=cargo +$(TOOLCHAIN)
 CLIPPY_ENV:=
 FEATURE_ARGS:=--all-features
 
-.PHONY: build run clean fmt fmt-check check test \
+.PHONY: build run clean fmt fmt-check check test pages-check nginx-check \
         clippy clippy-ci lint audit release-check \
-        docker-build docker-test docker-run
+        docker-build docker-push docker-test docker-test-push docker-run
 
 # ============================================================
 #  Clippy Lint Groups
@@ -87,48 +87,54 @@ CLIPPY_CI_FLAGS = \
 # ============================================================
 
 build:
-	$(CARGO) build --locked --release
+	cd api && $(CARGO) build --locked --release
 
 run:
-	$(CARGO) run --locked
+	cd api && $(CARGO) run --locked
 
 clean:
-	$(CARGO) clean
+	cd api && $(CARGO) clean
 
 check:
-	$(CARGO) check --locked --all-targets $(FEATURE_ARGS)
+	cd api && $(CARGO) check --locked --all-targets $(FEATURE_ARGS)
 
 fmt:
-	$(CARGO) fmt --all
+	cd api && $(CARGO) fmt --all
 
 fmt-check:
-	$(CARGO) fmt --all -- --check
+	cd api && $(CARGO) fmt --all -- --check
 
 test:
-	$(CARGO) test --locked --all-targets $(FEATURE_ARGS)
+	cd api && $(CARGO) test --locked --all-targets $(FEATURE_ARGS)
+
+pages-check:
+	node scripts/check-pages.mjs
+
+nginx-check:
+	./scripts/check-nginx.sh
 
 # ============================================================
 #  Lint
 # ============================================================
 
 clippy:
-	$(CLIPPY_ENV) $(CARGO) clippy --locked --all-targets $(FEATURE_ARGS) \
+	cd api && $(CLIPPY_ENV) $(CARGO) clippy --locked --all-targets $(FEATURE_ARGS) \
 		--message-format short -- $(CLIPPY_DEV_FLAGS)
 
 clippy-ci:
-	$(CLIPPY_ENV) $(CARGO) clippy --locked --all-targets $(FEATURE_ARGS) \
+	cd api && $(CLIPPY_ENV) $(CARGO) clippy --locked --all-targets $(FEATURE_ARGS) \
 		--message-format short -- $(CLIPPY_CI_FLAGS)
 
 lint: fmt-check clippy
 
 audit:
-	$(CARGO) audit
+	cd api && $(CARGO) audit
 
 # ============================================================
 #  Release Gate
 # ============================================================
 
-release-check: fmt-check test clippy-ci audit
+release-check: fmt-check test clippy-ci audit pages-check nginx-check
 	@echo ""
 	@echo "=========================================="
 	@echo "  OK  All checks passed. Ready to ship."
@@ -139,12 +145,16 @@ release-check: fmt-check test clippy-ci audit
 # ============================================================
 
 docker-build:
-	docker build --pull -t $(IMAGE):$(SANITIZED_VERSION) .
+	docker build --pull -f api/Dockerfile -t $(IMAGE):$(SANITIZED_VERSION) .
+
+docker-push: docker-build
 	docker push $(IMAGE):$(SANITIZED_VERSION)
 
 docker-test:
-	docker build --pull -t $(IMAGE):$(SANITIZED_VERSION)-test .
+	docker build --pull -f api/Dockerfile -t $(IMAGE):$(SANITIZED_VERSION)-test .
+
+docker-test-push: docker-test
 	docker push $(IMAGE):$(SANITIZED_VERSION)-test
 
 docker-run:
-	docker run --rm -p 8080:8080 $(IMAGE):$(SANITIZED_VERSION)
+	docker run --rm -p 127.0.0.1:8080:8080 $(IMAGE):$(SANITIZED_VERSION)

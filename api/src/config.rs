@@ -1,5 +1,6 @@
 use chrono::{Duration, Utc};
 use std::{env, fmt};
+use url::Url;
 
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 pub const DEFAULT_UPLOAD_DIR: &str = "./uploads";
@@ -77,14 +78,46 @@ impl ServerConfig {
                 DEFAULT_MAX_DOWNLOAD_COUNT,
             )?,
             image_max_download_count: parse_env_nonnegative_i32("IMAGE_MAX_DOWNLOAD_COUNT", 0)?,
-            public_base_url: optional_env("PUBLIC_BASE_URL")?
-                .map(|value| value.trim().trim_end_matches('/').to_string())
-                .filter(|value| !value.is_empty()),
+            public_base_url: parse_public_base_url(optional_env("PUBLIC_BASE_URL")?.as_deref())?,
             api_key: optional_env("API_KEY")?.filter(|value| !value.is_empty()),
             redis_addr: optional_env("REDIS_ADDR")?.filter(|value| !value.is_empty()),
             redis_db: parse_env_nonnegative_i64("REDIS_DB", 0)?,
         })
     }
+}
+
+fn parse_public_base_url(value: Option<&str>) -> Result<Option<String>, ConfigError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let url = parse_http_url("PUBLIC_BASE_URL", value)?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ConfigError::invalid(
+            "PUBLIC_BASE_URL",
+            value,
+            "an http(s) base URL without a query or fragment",
+        ));
+    }
+
+    Ok(Some(url.as_str().trim_end_matches('/').to_string()))
+}
+
+fn parse_http_url(key: &str, value: &str) -> Result<Url, ConfigError> {
+    let url =
+        Url::parse(value).map_err(|_| ConfigError::invalid(key, value, "a valid http(s) URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ConfigError::invalid(
+            key,
+            value,
+            "an http(s) URL with a host and without embedded credentials",
+        ));
+    }
+    Ok(url)
 }
 
 fn validate_file_expiration(file_expiration: Duration) -> Result<(), ConfigError> {
@@ -256,5 +289,21 @@ mod tests {
             clamp_duration(Duration::hours(2), Duration::minutes(1), Duration::hours(1)),
             Duration::hours(1)
         );
+    }
+
+    #[test]
+    fn public_base_url_is_validated_and_normalized() {
+        assert_eq!(parse_public_base_url(None).unwrap(), None);
+        assert_eq!(parse_public_base_url(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_public_base_url(Some(" https://files.example.test/base/ ")).unwrap(),
+            Some("https://files.example.test/base".to_string())
+        );
+        assert!(parse_public_base_url(Some("javascript:alert(1)")).is_err());
+        assert!(parse_public_base_url(Some("https://user@example.test")).is_err());
+        assert!(parse_public_base_url(Some("https://user:secret@example.test")).is_err());
+        assert!(parse_public_base_url(Some("https://example.test/?key=value")).is_err());
+        assert!(parse_public_base_url(Some("https://example.test/#fragment")).is_err());
+        assert!(parse_public_base_url(Some("https://")).is_err());
     }
 }
