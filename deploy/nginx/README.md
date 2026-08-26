@@ -63,6 +63,10 @@ curl/API-only endpoint.
   overwrites `Host` and `X-Forwarded-Proto`.
 - The 257 MiB Nginx body limit leaves framing room above the API's 256 MiB file
   limit. Keep both limits coordinated if either changes.
+- `POST /video-output/tickets` and the write-once `PUT /files/{token}.mp4`
+  deliberately require no Authorization header so xAI's ZDR worker can upload
+  directly. Treat the returned URL as a capability and keep ticket response
+  bodies out of logs.
 - Nginx strips any upstream `Access-Control-*` response policy before adding
   the checked-in one. Do not add another CORS transform at Cloudflare or in the
   Rust service.

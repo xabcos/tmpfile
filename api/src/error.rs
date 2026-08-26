@@ -12,6 +12,7 @@ pub enum AppError {
     NotFound(String),
     Unauthorized,
     PayloadTooLarge,
+    Conflict(String),
     Gone(String),
     InternalServerError(String),
 }
@@ -23,6 +24,7 @@ impl fmt::Display for AppError {
             Self::NotFound(msg) => write!(f, "Not Found: {msg}"),
             Self::Unauthorized => write!(f, "Unauthorized"),
             Self::PayloadTooLarge => write!(f, "Payload Too Large"),
+            Self::Conflict(msg) => write!(f, "Conflict: {msg}"),
             Self::Gone(msg) => write!(f, "Gone: {msg}"),
             Self::InternalServerError(msg) => write!(f, "Internal Server Error: {msg}"),
         }
@@ -41,6 +43,7 @@ impl IntoResponse for AppError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Payload Too Large".to_string(),
             ),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, msg),
             Self::Gone(msg) => (StatusCode::GONE, msg),
             Self::InternalServerError(msg) => {
                 error!(error = %msg, "Request failed with an internal error");

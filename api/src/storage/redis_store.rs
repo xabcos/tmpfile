@@ -16,7 +16,7 @@ pub struct RedisStore {
 
 const REDIS_CONNECTION_RETRIES: usize = 1;
 const METADATA_KEY_PREFIX: &str = "tmpfile:meta:";
-const METADATA_FIELDS: [&str; 7] = [
+const METADATA_FIELDS: [&str; 8] = [
     "original_name",
     "size",
     "extension",
@@ -24,6 +24,7 @@ const METADATA_FIELDS: [&str; 7] = [
     "expires_at",
     "download_count",
     "download_limit",
+    "is_video_ticket",
 ];
 
 fn parse_dt_rfc3339(value: &str, field: &str) -> AppResult<DateTime<Utc>> {
@@ -46,6 +47,18 @@ fn parse_i32_field(value: &str, field: &str) -> AppResult<i32> {
         .ok()
         .filter(|parsed| *parsed >= 0)
         .ok_or_else(|| AppError::InternalServerError(format!("invalid integer field: {field}")))
+}
+
+fn parse_video_ticket_field(value: Option<&str>) -> AppResult<bool> {
+    match value {
+        // Hashes created before video tickets existed have no such field and
+        // must remain ordinary, non-writable files.
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(AppError::InternalServerError(
+            "invalid boolean field: is_video_ticket".to_string(),
+        )),
+    }
 }
 
 fn expiry_score(expires_at: DateTime<Utc>) -> i64 {
@@ -140,6 +153,7 @@ return new_count
         let size = metadata.size.to_string();
         let download_count = metadata.download_count.to_string();
         let download_limit = metadata.download_limit.to_string();
+        let is_video_ticket = if metadata.is_video_ticket { "1" } else { "0" };
         let uploaded_at = metadata.uploaded_at.to_rfc3339();
         let expires_at = metadata.expires_at.to_rfc3339();
 
@@ -155,6 +169,7 @@ return new_count
                     ("expires_at", expires_at.as_str()),
                     ("download_count", download_count.as_str()),
                     ("download_limit", download_limit.as_str()),
+                    ("is_video_ticket", is_video_ticket),
                 ],
             )
             .zadd(
@@ -211,11 +226,14 @@ return new_count
         let expires_at = parse_dt_rfc3339(get(4, "expires_at")?, "expires_at")?;
         let download_count = parse_i32_field(get(5, "download_count")?, "download_count")?;
         let download_limit = parse_i32_field(get(6, "download_limit")?, "download_limit")?;
+        let is_video_ticket =
+            parse_video_ticket_field(values.get(7).and_then(|value| value.as_deref()))?;
 
         Ok(Some(FileMetadata {
             original_name,
             size,
             extension,
+            is_video_ticket,
             uploaded_at,
             expires_at,
             download_count,
@@ -560,6 +578,7 @@ mod tests {
             original_name: name.to_string(),
             size: 42,
             extension: "txt".to_string(),
+            is_video_ticket: false,
             uploaded_at: Utc::now(),
             expires_at,
             download_count: 0,
@@ -578,12 +597,23 @@ mod tests {
             Some((now + Duration::hours(1)).to_rfc3339()),
             Some("0".to_string()),
             Some("3".to_string()),
+            None,
         ];
         let parsed = RedisStore::parse_hash_metadata(VALID_TOKEN, &values)
             .unwrap()
             .unwrap();
         assert_eq!(parsed.original_name, "example.txt");
         assert_eq!(parsed.download_limit, 3);
+        assert!(!parsed.is_video_ticket);
+
+        let mut ticket = values.clone();
+        ticket[7] = Some("1".to_string());
+        assert!(
+            RedisStore::parse_hash_metadata(VALID_TOKEN, &ticket)
+                .unwrap()
+                .unwrap()
+                .is_video_ticket
+        );
 
         let mut invalid = values.clone();
         invalid[1] = Some("not-a-size".to_string());
@@ -592,6 +622,9 @@ mod tests {
         invalid[2] = Some(".txt".to_string());
         assert!(RedisStore::parse_hash_metadata(VALID_TOKEN, &invalid).is_err());
         invalid[2] = Some("TXT".to_string());
+        assert!(RedisStore::parse_hash_metadata(VALID_TOKEN, &invalid).is_err());
+        invalid = values.clone();
+        invalid[7] = Some("true".to_string());
         assert!(RedisStore::parse_hash_metadata(VALID_TOKEN, &invalid).is_err());
         assert_eq!(
             RedisStore::parse_hash_metadata(VALID_TOKEN, &vec![None; METADATA_FIELDS.len()])

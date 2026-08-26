@@ -8,8 +8,10 @@ use crate::config::{
 };
 use crate::error::AppError;
 use crate::models::FileMetadata;
+use axum::body::Body;
 use axum::extract::multipart::Field;
 use chrono::Utc;
+use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -20,6 +22,8 @@ use tokio::time::interval;
 use tracing::{error, info};
 
 const PARTIAL_UPLOAD_SUFFIX: &str = ".upload";
+const VIDEO_EXTENSION: &str = "mp4";
+const VIDEO_FILENAME: &str = "grok-video.mp4";
 
 #[derive(Clone)]
 pub struct FileServer {
@@ -208,6 +212,15 @@ impl FileServer {
                     return Ok((true, i64::try_from(size).unwrap_or(i64::MAX)));
                 }
 
+                // A crash can occur after the raw PUT is linked into place but
+                // before its completed size reaches the metadata store. Remove
+                // that uncommitted artifact and leave the ticket available for
+                // a retry until its normal expiration.
+                if metadata.is_video_ticket && metadata.size == 0 {
+                    info!("Found uncommitted video upload: {:?}", path);
+                    return remove_startup_artifact(&path).await;
+                }
+
                 if now >= metadata.expires_at {
                     info!(
                         "Found expired file: {:?} (expired at {})",
@@ -391,6 +404,7 @@ impl FileServer {
             original_name: filename.to_string(),
             size,
             extension,
+            is_video_ticket: false,
             uploaded_at: now,
             expires_at,
             download_count: 0,
@@ -416,6 +430,171 @@ impl FileServer {
         Ok(metadata)
     }
 
+    /// Reserve a short-lived capability token for a video result. The token is
+    /// stored before xAI receives the URL, but no file is created until the
+    /// raw PUT arrives. `is_video_ticket` makes the capability explicit instead
+    /// of treating every zero-byte MP4 as publicly writable.
+    pub async fn create_video_ticket(&self) -> AppResult<String> {
+        let now = Utc::now();
+        let Some(expires_at) = now.checked_add_signed(self.config.file_expiration) else {
+            return Err(AppError::InternalServerError(
+                "file expiration exceeds the supported calendar range".to_string(),
+            ));
+        };
+
+        for _ in 0..8 {
+            let token = TokenGenerator::generate();
+            let full_path = self.get_file_path(&token, VIDEO_EXTENSION)?;
+
+            // A random token collision is extraordinarily unlikely, but do
+            // not overwrite an existing file or metadata if one ever occurs.
+            if fs::try_exists(&full_path).await? {
+                continue;
+            }
+            match self.store.load(&token).await {
+                Ok(_) => continue,
+                Err(AppError::NotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+
+            let metadata = FileMetadata {
+                original_name: VIDEO_FILENAME.to_string(),
+                size: 0,
+                extension: VIDEO_EXTENSION.to_string(),
+                is_video_ticket: true,
+                uploaded_at: now,
+                expires_at,
+                download_count: 0,
+                download_limit: self.config.max_download_count,
+            };
+            self.store.save(&token, metadata).await?;
+            return Ok(token);
+        }
+
+        Err(AppError::InternalServerError(
+            "failed to allocate a unique video upload token".to_string(),
+        ))
+    }
+
+    /// Stream one raw video PUT into the reserved path. Pending ticket metadata
+    /// keeps the path unreadable until the final size is stored, while
+    /// `create_new` serializes concurrent PUTs for the same token.
+    pub async fn complete_video_upload(&self, token: &str, body: Body) -> AppResult<i64> {
+        if TokenGenerator::parse_path(token) != Some(token) {
+            return Err(AppError::BadRequest(
+                "Invalid video upload token".to_string(),
+            ));
+        }
+
+        let metadata = self.store.load(token).await?;
+        if !metadata.is_video_ticket || metadata.extension != VIDEO_EXTENSION {
+            return Err(AppError::BadRequest(
+                "Token is not a video upload ticket".to_string(),
+            ));
+        }
+        if metadata.size != 0 {
+            // PutObject targets are retryable. If xAI lost the first success
+            // response, acknowledge the retry without replacing stored bytes.
+            return Ok(metadata.size);
+        }
+        if Utc::now() >= metadata.expires_at {
+            return Err(AppError::Gone("Video upload ticket expired".to_string()));
+        }
+
+        let full_path = self.get_file_path(token, VIDEO_EXTENSION)?;
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        let file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full_path)
+            .await
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(AppError::Conflict(
+                    "Video upload ticket is already in progress or has been used".to_string(),
+                ));
+            }
+            Err(err) => {
+                return Err(AppError::InternalServerError(format!(
+                    "failed to create video upload {}: {err}",
+                    full_path.display()
+                )));
+            }
+        };
+        let pending_file = PendingFile::new(full_path);
+        let max_file_size = self.config.max_file_size;
+
+        let write_result: AppResult<u64> = async move {
+            let mut writer = BufWriter::with_capacity(FILE_WRITE_BUFFER_SIZE, file);
+            let mut stream = body.into_data_stream();
+            let mut total_size = 0u64;
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| {
+                    AppError::BadRequest("failed to read video upload body".to_string())
+                })?;
+                total_size = total_size
+                    .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                        AppError::BadRequest("file size exceeds supported range".to_string())
+                    })?)
+                    .ok_or_else(|| AppError::BadRequest("file size overflow".to_string()))?;
+
+                if total_size > max_file_size {
+                    return Err(AppError::PayloadTooLarge);
+                }
+
+                writer.write_all(&chunk).await?;
+            }
+
+            writer.flush().await?;
+            Ok(total_size)
+        }
+        .await;
+
+        let total_size = match write_result {
+            Ok(total_size) => total_size,
+            Err(err) => {
+                pending_file.remove().await;
+                return Err(err);
+            }
+        };
+        if total_size == 0 {
+            pending_file.remove().await;
+            return Err(AppError::BadRequest(
+                "Video upload body cannot be empty".to_string(),
+            ));
+        }
+        if Utc::now() >= metadata.expires_at {
+            pending_file.remove().await;
+            return Err(AppError::Gone("Video upload ticket expired".to_string()));
+        }
+
+        let Ok(size) = i64::try_from(total_size) else {
+            pending_file.remove().await;
+            return Err(AppError::PayloadTooLarge);
+        };
+
+        let mut completed = metadata;
+        completed.size = size;
+        if let Err(err) = self.store.save(token, completed).await {
+            pending_file.remove().await;
+            if let Err(cleanup_err) = self.store.remove(token).await {
+                error!(
+                    "Failed to roll back metadata for {} after video upload failure: {}",
+                    token, cleanup_err
+                );
+            }
+            return Err(err);
+        }
+
+        pending_file.persist();
+        Ok(size)
+    }
+
     pub async fn remove_file(&self, token: &str, metadata: &FileMetadata) -> AppResult<()> {
         let path = self.get_file_path(token, &metadata.extension)?;
         if let Err(err) = fs::remove_file(&path).await
@@ -426,7 +605,6 @@ impl FileServer {
                 path.display()
             )));
         }
-
         self.store.remove(token).await?;
 
         info!("Removed: {} -> {}", metadata.original_name, token);
@@ -622,6 +800,7 @@ mod tests {
                     original_name: "valid.txt".to_string(),
                     size: 5,
                     extension: "txt".to_string(),
+                    is_video_ticket: false,
                     uploaded_at: now,
                     expires_at: now + Duration::hours(1),
                     download_count: 0,
@@ -631,10 +810,30 @@ mod tests {
             .await
             .unwrap();
 
+        let pending_video_token = server.create_video_ticket().await.unwrap();
+        let pending_video_path = server
+            .get_file_path(&pending_video_token, VIDEO_EXTENSION)
+            .unwrap();
+        fs::create_dir_all(pending_video_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&pending_video_path, b"uncommitted")
+            .await
+            .unwrap();
+
         server.startup_cleanup().await.unwrap();
         assert!(!partial_path.exists());
         assert!(!orphan_path.exists());
         assert!(!unknown_path.exists());
         assert!(valid_path.exists());
+        assert!(!pending_video_path.exists());
+        assert!(
+            server
+                .store
+                .load(&pending_video_token)
+                .await
+                .unwrap()
+                .is_video_ticket
+        );
     }
 }

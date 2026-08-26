@@ -86,7 +86,13 @@ fn build_app(server: Arc<FileServer>) -> Router {
 
     Router::new()
         .route("/upload", post(handlers::handle_upload))
-        .route("/files/{path}", get(handlers::handle_download))
+        // This pair is intentionally independent of API_KEY. xAI sends the
+        // generated video directly to the returned URL with a raw PUT.
+        .route("/video-output/tickets", post(handlers::handle_video_ticket))
+        .route(
+            "/files/{path}",
+            get(handlers::handle_download).put(handlers::handle_video_upload),
+        )
         .route("/list", get(handlers::handle_list_files))
         // Multipart headers and boundaries count toward the request size. File
         // content is still checked precisely while it is streamed to disk.

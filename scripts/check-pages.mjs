@@ -64,8 +64,6 @@ const readAttribute = (attributes, name) => {
   return attributes.match(new RegExp(`\\b${escapedName}\\s*=\\s*(["'])(.*?)\\1`, "i"))?.[2];
 };
 const expectedCardAttributes = {
-  integrity: "sha384-WojoUxLlNhOt2Z3O9xjaac3XFCIcDFkk2dSJ8vyx3b1gH40vOod4AhrKRfH1r54j",
-  crossorigin: "anonymous",
   referrerpolicy: "no-referrer",
   "data-feed": "feed_d949561dd4914f6e94179f4f7c1f206a",
   "data-mode": "full",

@@ -88,6 +88,7 @@ mod tests {
                 original_name: name.to_string(),
                 size,
                 extension: String::new(),
+                is_video_ticket: false,
                 uploaded_at,
                 expires_at: uploaded_at + Duration::hours(1),
                 download_count: 0,

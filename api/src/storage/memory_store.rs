@@ -139,6 +139,7 @@ mod tests {
             original_name: "example.txt".to_string(),
             size: 7,
             extension: "txt".to_string(),
+            is_video_ticket: false,
             uploaded_at: Utc::now(),
             expires_at,
             download_count: 0,

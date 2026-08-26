@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.8", features = ["multipart"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["async-await", "std"] }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "time", "sync"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 serde = { version = "1.0.228", features = ["derive"] }

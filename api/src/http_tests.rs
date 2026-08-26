@@ -291,6 +291,188 @@ async fn head_does_not_consume_the_download_limit() {
 }
 
 #[tokio::test]
+async fn open_video_ticket_accepts_one_raw_put_and_keeps_regular_uploads_protected() {
+    let (app, _server, upload_dir) = test_app(5, Some("secret")).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/video-output/tickets")
+                .header(header::HOST, "ignored.example.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    let ticket = response_json(response).await;
+    assert!(
+        ticket["upload_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://files.example.test/files/")
+    );
+    assert_eq!(ticket.as_object().unwrap().len(), 1);
+    assert_eq!(count_files(upload_dir.path()), 0);
+
+    let upload_path = ticket["upload_url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("https://files.example.test")
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put(upload_path)
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(Body::from(b"video".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(count_files(upload_dir.path()), 1);
+
+    let download_path = upload_path;
+    let response = app
+        .clone()
+        .oneshot(Request::get(download_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp4");
+    assert!(
+        response.headers()[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("inline;")
+    );
+    assert_eq!(
+        &to_bytes(response.into_body(), 1024).await.unwrap()[..],
+        b"video"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put(upload_path)
+                .body(Body::from(b"again".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(Request::get(upload_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &to_bytes(response.into_body(), 1024).await.unwrap()[..],
+        b"video",
+        "an idempotent retry must not replace the completed video"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(upload_request("ordinary.txt", b"hello", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // A regular zero-byte MP4 is not a video ticket and must not become
+    // publicly writable merely because its size and extension look similar.
+    let response = app
+        .clone()
+        .oneshot(upload_request("empty.mp4", b"", Some("secret")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let ordinary = response_json(response).await;
+    let ordinary_path = ordinary["direct_link"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("https://files.example.test")
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::put(ordinary_path)
+                .body(Body::from(b"overwrite".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn video_put_enforces_size_and_rejects_empty_or_invalid_targets() {
+    let (app, _server, upload_dir) = test_app(5, Some("secret")).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/video-output/tickets")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let ticket = response_json(response).await;
+    let upload_path = ticket["upload_url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("https://files.example.test")
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(Request::put(upload_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(count_files(upload_dir.path()), 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put(upload_path)
+                .body(Body::from(b"123456".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(count_files(upload_dir.path()), 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put(upload_path)
+                .body(Body::from(b"video".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(count_files(upload_dir.path()), 1);
+
+    let response = app
+        .oneshot(
+            Request::put("/files/not-a-valid-token.mp4")
+                .body(Body::from(b"video".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn incomplete_upload_is_removed_and_listing_is_disabled_without_an_api_key() {
     let (app, _server, upload_dir) = test_app(1024, None).await;
 

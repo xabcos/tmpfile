@@ -1,12 +1,12 @@
 use crate::config::{FILE_READ_BUFFER_SIZE, MAX_FILENAME_BYTES, format_duration};
 use crate::error::AppError;
-use crate::models::{FileItem, ListFilesResponse, UploadResponse};
+use crate::models::{FileItem, ListFilesResponse, UploadResponse, VideoTicketResponse};
 use crate::storage::{DownloadClaim, FileServer, FileSort, TokenGenerator};
 use axum::{
     Json,
     body::Body,
     extract::{Multipart, Path, State},
-    http::{HeaderMap, HeaderValue, Method, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::IntoResponse,
 };
 use chrono::Utc;
@@ -97,10 +97,22 @@ fn download_url(base_url: &str, token: &str, extension: &str) -> String {
     }
 }
 
+fn video_token(path: &str) -> AppResult<&str> {
+    let token = TokenGenerator::parse_path(path)
+        .ok_or_else(|| AppError::BadRequest("Invalid video upload token".to_string()))?;
+    if path.get(token.len()..) != Some(".mp4") {
+        return Err(AppError::BadRequest(
+            "Video upload URL must use the .mp4 extension".to_string(),
+        ));
+    }
+    Ok(token)
+}
+
 fn content_type_for_extension(extension: &str) -> &'static str {
     match extension {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
+        "mp4" => "video/mp4",
         "webp" => "image/webp",
         "gif" => "image/gif",
         "avif" => "image/avif",
@@ -127,6 +139,7 @@ fn is_inline_content_type(content_type: &str) -> bool {
             | "image/avif"
             | "image/x-icon"
             | "image/bmp"
+            | "video/mp4"
     )
 }
 
@@ -230,6 +243,48 @@ pub async fn handle_upload(
     Err(AppError::BadRequest("No file field found".to_string()))
 }
 
+/// Creates a capability URL for an xAI ZDR video result. This endpoint is
+/// deliberately unauthenticated: the high-entropy token is the capability,
+/// and YAI's project key is not available on xAI's subsequent server-to-server
+/// PUT request.
+pub async fn handle_video_ticket(
+    State(server): State<Arc<FileServer>>,
+    headers: HeaderMap,
+) -> AppResult<impl IntoResponse> {
+    let token = server.create_video_ticket().await?;
+    let base_url = request_base_url(&headers, server.config.public_base_url.as_deref());
+    let response = VideoTicketResponse {
+        // xAI may echo output.upload_url as video.url after completion, so the
+        // one-time PUT capability also remains readable after upload.
+        upload_url: download_url(&base_url, &token, "mp4"),
+    };
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    info!("Created unauthenticated video upload ticket");
+    Ok((StatusCode::CREATED, response_headers, Json(response)))
+}
+
+/// Receives the generated video bytes. xAI uses a raw PUT rather than the
+/// multipart format accepted by `/upload`, so this path is streamed directly
+/// to disk and can be used exactly as `output.upload_url`.
+pub async fn handle_video_upload(
+    State(server): State<Arc<FileServer>>,
+    Path(path): Path<String>,
+    body: Body,
+) -> AppResult<impl IntoResponse> {
+    let token = video_token(&path)?;
+    let size = server.complete_video_upload(token, body).await?;
+
+    info!("Accepted unauthenticated video upload ({size} stored bytes)");
+    // Match the successful status returned by an S3 PutObject target, which is
+    // the upload behavior xAI's official Grok Build flow is designed around.
+    Ok(StatusCode::OK)
+}
+
 pub async fn handle_download(
     method: Method,
     State(server): State<Arc<FileServer>>,
@@ -242,6 +297,9 @@ pub async fn handle_download(
 
     if Utc::now() >= metadata.expires_at {
         return Err(AppError::Gone("File expired".to_string()));
+    }
+    if metadata.is_video_ticket && metadata.size == 0 {
+        return Err(AppError::NotFound("Video output is not ready".to_string()));
     }
 
     if metadata.download_limit > 0 && metadata.download_count >= metadata.download_limit {
