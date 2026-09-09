@@ -382,6 +382,8 @@ impl FileServer {
             ));
         };
 
+        // Hard-linking publishes the completed upload while preserving the
+        // create-new/no-overwrite guarantee if a token collision occurs.
         fs::hard_link(&partial_path, &full_path)
             .await
             .map_err(|err| {

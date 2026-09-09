@@ -3,7 +3,7 @@
   X-Frame-Options: DENY
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(), geolocation=(), microphone=(), payment=(), usb=()
-  Content-Security-Policy: default-src 'self'; script-src 'self' https://card.xairouter.com 'sha256-fqUW1SNlKvYnqsXoMoyuhmiRKFv3XzP9wP+jGxSsBGQ=' 'sha256-QLWaWg+z7YZS/b+SPJWghhVHwD+WpvsHT1/bYXeIvE8='; script-src-attr 'none'; style-src 'self' 'unsafe-inline' https://card.xairouter.com; connect-src 'self' https: http:; img-src 'self' data: https:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; worker-src 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://card.xairouter.com 'sha256-fqUW1SNlKvYnqsXoMoyuhmiRKFv3XzP9wP+jGxSsBGQ=' 'sha256-B5xGuWgdeJTSlQ2CN0Dnwuw6OcQBiwdBrMaOmhxfOxA='; script-src-attr 'none'; style-src 'self' 'unsafe-inline' https://card.xairouter.com; connect-src 'self' https: http:; img-src 'self' data: https:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; worker-src 'none'
 
 /
   Cache-Control: no-cache, max-age=0, must-revalidate

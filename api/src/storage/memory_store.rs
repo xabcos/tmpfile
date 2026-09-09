@@ -85,6 +85,10 @@ impl MetadataStore for MemoryStore {
     }
 
     async fn list_expired(&self, limit: usize) -> AppResult<Vec<StoredFile>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut expired = Vec::new();
         let now = Utc::now();
 
@@ -161,6 +165,7 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].0, "expired");
         assert_eq!(expired[0].1.expires_at, expires_at);
+        assert!(store.list_expired(0).await.unwrap().is_empty());
     }
 
     #[tokio::test]

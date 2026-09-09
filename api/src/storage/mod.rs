@@ -59,7 +59,12 @@ fn sort_and_paginate_files(
     sort_by: FileSort,
     desc: bool,
 ) -> (Vec<StoredFile>, usize) {
-    files.sort_unstable_by(|left, right| {
+    let total = files.len();
+    if limit == 0 || offset >= total {
+        return (Vec::new(), total);
+    }
+
+    let mut compare = |left: &StoredFile, right: &StoredFile| {
         let primary = match sort_by {
             FileSort::UploadedAt => left.1.uploaded_at.cmp(&right.1.uploaded_at),
             FileSort::Size => left.1.size.cmp(&right.1.size),
@@ -68,10 +73,20 @@ fn sort_and_paginate_files(
         let primary = if desc { primary.reverse() } else { primary };
 
         primary.then_with(|| left.0.cmp(&right.0))
-    });
+    };
 
-    let total = files.len();
-    let page = files.into_iter().skip(offset).take(limit).collect();
+    let end = offset.saturating_add(limit).min(total);
+    if end < total {
+        // Only the requested prefix needs ordering. Selection is linear on
+        // average and avoids sorting the complete store for the common early
+        // pages of a listing.
+        files.select_nth_unstable_by(end - 1, &mut compare);
+        files[..end].sort_unstable_by(compare);
+    } else {
+        files.sort_unstable_by(compare);
+    }
+
+    let page = files.into_iter().skip(offset).take(end - offset).collect();
     (page, total)
 }
 
@@ -111,6 +126,17 @@ mod tests {
             page.into_iter().map(|(token, _)| token).collect::<Vec<_>>(),
             ["c", "a"]
         );
+
+        let (page, total) = sort_and_paginate_files(files.clone(), 1, 1, FileSort::Name, false);
+        assert_eq!(total, 3);
+        assert_eq!(
+            page.into_iter().map(|(token, _)| token).collect::<Vec<_>>(),
+            ["a"]
+        );
+
+        let (page, total) = sort_and_paginate_files(files.clone(), 0, 0, FileSort::Name, false);
+        assert_eq!(total, 3);
+        assert!(page.is_empty());
 
         let (page, total) =
             sort_and_paginate_files(files, usize::MAX, usize::MAX, FileSort::Size, true);

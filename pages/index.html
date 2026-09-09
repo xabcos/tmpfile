@@ -326,6 +326,7 @@ const $ = id => document.getElementById(id);
 const MAX_CONCURRENT_UPLOADS = 3;
 const MAX_HISTORY_ITEMS = 512;
 const HISTORY_KEY = 'uploadHistory';
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB'];
 const DEFAULT_SERVER_URL = typeof window.TMPFILE_CONFIG?.serverUrl === 'string'
   ? window.TMPFILE_CONFIG.serverUrl.trim().replace(/\/+$/, '')
   : '';
@@ -346,23 +347,22 @@ const els = {
   clearBtn: $('clearBtn')
 };
 
+const storageBackend = key => key === 'apiKey' ? sessionStorage : localStorage;
+
 const storage = {
   get(key) {
     try {
-      const backend = key === 'apiKey' ? sessionStorage : localStorage;
-      return backend.getItem(key) || '';
+      return storageBackend(key).getItem(key) || '';
     } catch { return ''; }
   },
   set(key, value) {
     try {
-      const backend = key === 'apiKey' ? sessionStorage : localStorage;
-      backend.setItem(key, value);
+      storageBackend(key).setItem(key, value);
     } catch { showError('Unable to save local data'); }
   },
   remove(key) {
     try {
-      const backend = key === 'apiKey' ? sessionStorage : localStorage;
-      backend.removeItem(key);
+      storageBackend(key).removeItem(key);
     } catch {}
   }
 };
@@ -429,9 +429,8 @@ const formatBytes = bytes => {
   bytes = Number(bytes);
   if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
   if (bytes === 0) return '0 B';
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1);
-  return `${parseFloat((bytes / 1024 ** i).toFixed(1))} ${sizes[i]}`;
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), BYTE_UNITS.length - 1);
+  return `${parseFloat((bytes / 1024 ** i).toFixed(1))} ${BYTE_UNITS[i]}`;
 };
 
 const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
