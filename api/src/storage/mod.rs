@@ -6,6 +6,8 @@ mod token;
 use crate::config::MAX_FILE_EXTENSION_LENGTH;
 use crate::error::AppError;
 use crate::models::FileMetadata;
+use memory_store::MemoryStore;
+use redis_store::RedisStore;
 
 pub use file_server::FileServer;
 pub use token::TokenGenerator;
@@ -26,20 +28,59 @@ pub enum DownloadClaim {
     LimitReached,
 }
 
-#[async_trait::async_trait]
-pub trait MetadataStore: Send + Sync {
-    async fn save(&self, token: &str, metadata: FileMetadata) -> AppResult<()>;
-    async fn load(&self, token: &str) -> AppResult<FileMetadata>;
-    async fn claim_download(&self, token: &str) -> AppResult<DownloadClaim>;
-    async fn remove(&self, token: &str) -> AppResult<()>;
-    async fn list_expired(&self, limit: usize) -> AppResult<Vec<StoredFile>>;
-    async fn list_files(
+pub(crate) enum MetadataStore {
+    Memory(MemoryStore),
+    Redis(RedisStore),
+}
+
+impl MetadataStore {
+    pub(crate) async fn save(&self, token: &str, metadata: FileMetadata) -> AppResult<()> {
+        match self {
+            Self::Memory(store) => store.save(token, metadata).await,
+            Self::Redis(store) => store.save(token, metadata).await,
+        }
+    }
+
+    pub(crate) async fn load(&self, token: &str) -> AppResult<FileMetadata> {
+        match self {
+            Self::Memory(store) => store.load(token).await,
+            Self::Redis(store) => store.load(token).await,
+        }
+    }
+
+    pub(crate) async fn claim_download(&self, token: &str) -> AppResult<DownloadClaim> {
+        match self {
+            Self::Memory(store) => store.claim_download(token).await,
+            Self::Redis(store) => store.claim_download(token).await,
+        }
+    }
+
+    pub(crate) async fn remove(&self, token: &str) -> AppResult<()> {
+        match self {
+            Self::Memory(store) => store.remove(token).await,
+            Self::Redis(store) => store.remove(token).await,
+        }
+    }
+
+    pub(crate) async fn list_expired(&self, limit: usize) -> AppResult<Vec<StoredFile>> {
+        match self {
+            Self::Memory(store) => store.list_expired(limit).await,
+            Self::Redis(store) => store.list_expired(limit).await,
+        }
+    }
+
+    pub(crate) async fn list_files(
         &self,
         offset: usize,
         limit: usize,
         sort_by: FileSort,
         desc: bool,
-    ) -> AppResult<(Vec<StoredFile>, usize)>;
+    ) -> AppResult<(Vec<StoredFile>, usize)> {
+        match self {
+            Self::Memory(store) => store.list_files(offset, limit, sort_by, desc).await,
+            Self::Redis(store) => store.list_files(offset, limit, sort_by, desc).await,
+        }
+    }
 }
 
 type AppResult<T> = Result<T, AppError>;

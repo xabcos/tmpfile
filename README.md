@@ -177,12 +177,11 @@ Finite limits also add `max_downloads` and `remaining_downloads`.
 
 ### `GET|HEAD /files/{token}[.{extension}]`
 
-Downloads the file. `HEAD` does not consume a download. Accepted `GET` requests
-do consume one count even if the client later interrupts the transfer.
+Downloads the file. `HEAD` returns the metadata headers without a body.
 
-Download responses use `Cache-Control: private, no-store`: token URLs have
-expiration and count semantics and must not be served from an intermediary CDN
-cache.
+Download responses use `Cache-Control: public, max-age=31536000, immutable`.
+Each token URL identifies one immutable file, so browsers and CDNs can reuse the
+response without another round trip.
 
 ### `POST /video-output/tickets`
 
@@ -292,7 +291,7 @@ Pages.
 - Use Redis when metadata must survive API restarts.
 - Persist `/home/nonroot/uploads` when running the non-root Docker image.
 - Put the API behind HTTPS and set `PUBLIC_BASE_URL` explicitly in production.
-- Do not CDN-cache `/files/*`; the API response already sends `private,
-  no-store`, and proxy rules should respect it.
+- CDN-cache `/files/*` responses. Token URLs identify immutable files and are
+  safe to reuse for their cache lifetime.
 - Keep the API port private, use the exact Nginx Origin map, and keep API keys
   out of static assets.

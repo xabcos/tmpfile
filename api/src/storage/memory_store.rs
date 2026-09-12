@@ -1,6 +1,4 @@
-use super::{
-    AppResult, DownloadClaim, FileSort, MetadataStore, StoredFile, sort_and_paginate_files,
-};
+use super::{AppResult, DownloadClaim, FileSort, StoredFile, sort_and_paginate_files};
 use crate::config::MEMORY_SHARD_COUNT;
 use crate::error::AppError;
 use crate::models::FileMetadata;
@@ -38,9 +36,8 @@ impl Default for MemoryStore {
     }
 }
 
-#[async_trait::async_trait]
-impl MetadataStore for MemoryStore {
-    async fn save(&self, token: &str, metadata: FileMetadata) -> AppResult<()> {
+impl MemoryStore {
+    pub(super) async fn save(&self, token: &str, metadata: FileMetadata) -> AppResult<()> {
         let shard = self.get_shard_for_token(token);
         let mut guard = shard.write().await;
         guard.insert(token.to_string(), metadata);
@@ -48,7 +45,7 @@ impl MetadataStore for MemoryStore {
         Ok(())
     }
 
-    async fn load(&self, token: &str) -> AppResult<FileMetadata> {
+    pub(super) async fn load(&self, token: &str) -> AppResult<FileMetadata> {
         let shard = self.get_shard_for_token(token);
         let guard = shard.read().await;
         let metadata = guard.get(token).cloned();
@@ -56,7 +53,7 @@ impl MetadataStore for MemoryStore {
         metadata.ok_or_else(|| AppError::NotFound("file not found".to_string()))
     }
 
-    async fn claim_download(&self, token: &str) -> AppResult<DownloadClaim> {
+    pub(super) async fn claim_download(&self, token: &str) -> AppResult<DownloadClaim> {
         let shard = self.get_shard_for_token(token);
         let mut guard = shard.write().await;
         let metadata = guard
@@ -76,7 +73,7 @@ impl MetadataStore for MemoryStore {
         Ok(claim)
     }
 
-    async fn remove(&self, token: &str) -> AppResult<()> {
+    pub(super) async fn remove(&self, token: &str) -> AppResult<()> {
         let shard = self.get_shard_for_token(token);
         let mut guard = shard.write().await;
         guard.remove(token);
@@ -84,7 +81,7 @@ impl MetadataStore for MemoryStore {
         Ok(())
     }
 
-    async fn list_expired(&self, limit: usize) -> AppResult<Vec<StoredFile>> {
+    pub(super) async fn list_expired(&self, limit: usize) -> AppResult<Vec<StoredFile>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -107,7 +104,7 @@ impl MetadataStore for MemoryStore {
         Ok(expired)
     }
 
-    async fn list_files(
+    pub(super) async fn list_files(
         &self,
         offset: usize,
         limit: usize,

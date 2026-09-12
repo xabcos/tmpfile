@@ -28,7 +28,7 @@ const VIDEO_FILENAME: &str = "grok-video.mp4";
 #[derive(Clone)]
 pub struct FileServer {
     pub config: Arc<ServerConfig>,
-    pub store: Arc<dyn MetadataStore>,
+    pub(crate) store: Arc<MetadataStore>,
 }
 
 struct PendingFile {
@@ -86,18 +86,18 @@ impl Drop for PendingFile {
 
 impl FileServer {
     pub async fn new(config: ServerConfig) -> AppResult<Self> {
-        let store: Arc<dyn MetadataStore> = if let Some(redis_addr) = &config.redis_addr {
+        let store = if let Some(redis_addr) = &config.redis_addr {
             let redis_store = RedisStore::new(redis_addr, config.redis_db).await?;
             info!("Using Redis storage backend at {}", redis_addr);
-            Arc::new(redis_store)
+            MetadataStore::Redis(redis_store)
         } else {
             info!("Using in-memory storage backend");
-            Arc::new(MemoryStore::new())
+            MetadataStore::Memory(MemoryStore::new())
         };
 
         Ok(Self {
             config: Arc::new(config),
-            store,
+            store: Arc::new(store),
         })
     }
 

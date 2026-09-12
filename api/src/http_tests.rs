@@ -159,7 +159,7 @@ async fn upload_download_and_list_cover_the_http_contract_and_boundaries() {
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(
         response.headers()[header::CACHE_CONTROL],
-        "private, no-store"
+        "public, max-age=31536000, immutable"
     );
     assert!(response.headers().get(header::ACCEPT_RANGES).is_none());
     let disposition = response.headers()[header::CONTENT_DISPOSITION]
@@ -262,7 +262,7 @@ async fn head_does_not_consume_the_download_limit() {
     assert_eq!(response.headers()[header::CONTENT_LENGTH], "5");
     assert_eq!(
         response.headers()[header::CACHE_CONTROL],
-        "private, no-store"
+        "public, max-age=31536000, immutable"
     );
     assert_eq!(
         response.headers()[header::CONTENT_TYPE],

@@ -1,6 +1,6 @@
 use super::{
-    AppResult, DownloadClaim, FileSort, MetadataStore, StoredFile, TokenGenerator,
-    is_valid_extension, sort_and_paginate_files,
+    AppResult, DownloadClaim, FileSort, StoredFile, TokenGenerator, is_valid_extension,
+    sort_and_paginate_files,
 };
 use crate::error::AppError;
 use crate::models::FileMetadata;
@@ -371,22 +371,21 @@ return new_count
     }
 }
 
-#[async_trait::async_trait]
-impl MetadataStore for RedisStore {
-    async fn save(&self, token: &str, metadata: FileMetadata) -> AppResult<()> {
+impl RedisStore {
+    pub(super) async fn save(&self, token: &str, metadata: FileMetadata) -> AppResult<()> {
         self.redis_retry("metadata save", |conn| {
             self.save_once(conn, token, &metadata)
         })
         .await
     }
 
-    async fn load(&self, token: &str) -> AppResult<FileMetadata> {
+    pub(super) async fn load(&self, token: &str) -> AppResult<FileMetadata> {
         self.load_metadata_from_hash(token)
             .await?
             .ok_or_else(|| AppError::NotFound("file not found".to_string()))
     }
 
-    async fn claim_download(&self, token: &str) -> AppResult<DownloadClaim> {
+    pub(super) async fn claim_download(&self, token: &str) -> AppResult<DownloadClaim> {
         let mut conn = self.conn_manager.clone();
         let key = Self::metadata_key(token);
 
@@ -411,7 +410,7 @@ impl MetadataStore for RedisStore {
         }
     }
 
-    async fn remove(&self, token: &str) -> AppResult<()> {
+    pub(super) async fn remove(&self, token: &str) -> AppResult<()> {
         let key = Self::metadata_key(token);
 
         self.redis_retry("metadata remove", |mut conn| {
@@ -425,7 +424,7 @@ impl MetadataStore for RedisStore {
         .await
     }
 
-    async fn list_expired(&self, limit: usize) -> AppResult<Vec<StoredFile>> {
+    pub(super) async fn list_expired(&self, limit: usize) -> AppResult<Vec<StoredFile>> {
         let limit = isize::try_from(limit)
             .map_err(|_| AppError::InternalServerError("cleanup batch is too large".into()))?;
         let now_score = Utc::now().timestamp();
@@ -473,7 +472,7 @@ impl MetadataStore for RedisStore {
         Ok(expired)
     }
 
-    async fn list_files(
+    pub(super) async fn list_files(
         &self,
         offset: usize,
         limit: usize,
