@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:bookworm AS builder
+FROM rust:trixie AS builder
 WORKDIR /app
 
 COPY api/Cargo.toml api/Cargo.lock ./
