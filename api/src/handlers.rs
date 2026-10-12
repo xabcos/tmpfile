@@ -333,13 +333,9 @@ pub async fn handle_download(
         header::CONTENT_DISPOSITION,
         content_disposition(disposition, &metadata.original_name),
     );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(metadata.size));
     headers.insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&metadata.size.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0")),
-    );
-    headers.insert(
-        header::HeaderName::from_static("x-content-type-options"),
+        header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(
@@ -377,7 +373,7 @@ pub async fn handle_download(
     );
 
     if metadata.download_limit > 0 && new_count >= metadata.download_limit {
-        schedule_file_removal(server.clone(), token.to_string(), metadata.clone());
+        schedule_file_removal(server, token.to_string(), metadata);
     }
 
     let stream = ReaderStream::with_capacity(file, FILE_READ_BUFFER_SIZE);

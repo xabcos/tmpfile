@@ -8,6 +8,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     routing::{get, post},
+    serve::ListenerExt,
 };
 use config::{MULTIPART_OVERHEAD_BYTES, ServerConfig, format_duration};
 use std::{process::ExitCode, sync::Arc};
@@ -72,7 +73,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_app(server);
 
     let addr: std::net::SocketAddr = config.listen_addr.parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Downloads stream from disk after the headers are flushed. Without
+    // TCP_NODELAY, Nagle holds each small body until the peer's delayed ACK.
+    let listener = tokio::net::TcpListener::bind(addr).await?.tap_io(|tcp| {
+        if let Err(err) = tcp.set_nodelay(true) {
+            warn!(
+                "Failed to set TCP_NODELAY on an accepted connection: {}",
+                err
+            );
+        }
+    });
     info!("Server listening on {}", addr);
 
     axum::serve(listener, app).await?;

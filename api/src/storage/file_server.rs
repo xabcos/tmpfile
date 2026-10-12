@@ -8,14 +8,14 @@ use crate::config::{
 };
 use crate::error::AppError;
 use crate::models::FileMetadata;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::multipart::Field;
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::fs::{self, OpenOptions};
+use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::task::JoinSet;
 use tokio::time::interval;
@@ -221,34 +221,29 @@ impl FileServer {
                     return remove_startup_artifact(&path).await;
                 }
 
-                if now >= metadata.expires_at {
+                let removal_failure = if now >= metadata.expires_at {
                     info!(
                         "Found expired file: {:?} (expired at {})",
                         path, metadata.expires_at
                     );
-                    let size = metadata.size;
-                    fs::remove_file(&path).await.map_err(|e| {
-                        AppError::InternalServerError(format!("Failed to remove expired file: {e}"))
-                    })?;
-                    self.store.remove(token).await?;
-                    return Ok((true, size));
-                }
-
-                if metadata.download_limit > 0 && metadata.download_count >= metadata.download_limit
+                    "Failed to remove expired file"
+                } else if metadata.download_limit > 0
+                    && metadata.download_count >= metadata.download_limit
                 {
                     info!(
                         "Found file exceeding download limit: {:?} ({}/{})",
                         path, metadata.download_count, metadata.download_limit
                     );
-                    let size = metadata.size;
-                    fs::remove_file(&path).await.map_err(|e| {
-                        AppError::InternalServerError(format!("Failed to remove file: {e}"))
-                    })?;
-                    self.store.remove(token).await?;
-                    return Ok((true, size));
-                }
+                    "Failed to remove file"
+                } else {
+                    return Ok((false, 0));
+                };
 
-                Ok((false, 0))
+                fs::remove_file(&path).await.map_err(|e| {
+                    AppError::InternalServerError(format!("{removal_failure}: {e}"))
+                })?;
+                self.store.remove(token).await?;
+                Ok((true, metadata.size))
             }
             Err(AppError::NotFound(_)) => {
                 info!("Found orphaned file (no metadata): {:?}", path);
@@ -315,7 +310,7 @@ impl FileServer {
     pub async fn save_file(
         &self,
         token: &str,
-        mut field: Field<'_>,
+        field: Field<'_>,
         filename: &str,
     ) -> AppResult<FileMetadata> {
         let extension = sanitized_extension(filename).unwrap_or_default();
@@ -338,30 +333,8 @@ impl FileServer {
                 ))
             })?;
         let partial_file = PendingFile::new(partial_path.clone());
-        let max_file_size = self.config.max_file_size;
-
-        let write_result: AppResult<u64> = async move {
-            let mut writer = BufWriter::with_capacity(FILE_WRITE_BUFFER_SIZE, file);
-            let mut total_size = 0u64;
-
-            while let Some(chunk) = field.chunk().await.map_err(AppError::from)? {
-                total_size = total_size
-                    .checked_add(u64::try_from(chunk.len()).map_err(|_| {
-                        AppError::BadRequest("file size exceeds supported range".into())
-                    })?)
-                    .ok_or_else(|| AppError::BadRequest("file size overflow".into()))?;
-
-                if total_size > max_file_size {
-                    return Err(AppError::PayloadTooLarge);
-                }
-
-                writer.write_all(&chunk).await?;
-            }
-
-            writer.flush().await?;
-            Ok(total_size)
-        }
-        .await;
+        let write_result =
+            write_limited(file, field, self.config.max_file_size, AppError::from).await;
 
         let total_size = match write_result {
             Ok(total_size) => total_size,
@@ -528,33 +501,12 @@ impl FileServer {
             }
         };
         let pending_file = PendingFile::new(full_path);
-        let max_file_size = self.config.max_file_size;
-
-        let write_result: AppResult<u64> = async move {
-            let mut writer = BufWriter::with_capacity(FILE_WRITE_BUFFER_SIZE, file);
-            let mut stream = body.into_data_stream();
-            let mut total_size = 0u64;
-
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|_| {
-                    AppError::BadRequest("failed to read video upload body".to_string())
-                })?;
-                total_size = total_size
-                    .checked_add(u64::try_from(chunk.len()).map_err(|_| {
-                        AppError::BadRequest("file size exceeds supported range".to_string())
-                    })?)
-                    .ok_or_else(|| AppError::BadRequest("file size overflow".to_string()))?;
-
-                if total_size > max_file_size {
-                    return Err(AppError::PayloadTooLarge);
-                }
-
-                writer.write_all(&chunk).await?;
-            }
-
-            writer.flush().await?;
-            Ok(total_size)
-        }
+        let write_result = write_limited(
+            file,
+            body.into_data_stream(),
+            self.config.max_file_size,
+            |_| AppError::BadRequest("failed to read video upload body".to_string()),
+        )
         .await;
 
         let total_size = match write_result {
@@ -670,6 +622,41 @@ impl FileServer {
     }
 }
 
+/// Streams `chunks` into `file` through the write buffer and rejects content
+/// beyond `max_size` bytes. Returns the number of bytes written.
+async fn write_limited<S, E>(
+    file: File,
+    chunks: S,
+    max_size: u64,
+    read_error: impl Fn(E) -> AppError,
+) -> AppResult<u64>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+{
+    let mut chunks = std::pin::pin!(chunks);
+    let mut writer = BufWriter::with_capacity(FILE_WRITE_BUFFER_SIZE, file);
+    let mut total_size = 0u64;
+
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(&read_error)?;
+        total_size = total_size
+            .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                AppError::BadRequest("file size exceeds supported range".to_string())
+            })?)
+            .ok_or_else(|| AppError::BadRequest("file size overflow".to_string()))?;
+
+        if total_size > max_size {
+            return Err(AppError::PayloadTooLarge);
+        }
+
+        writer.write_all(&chunk).await?;
+    }
+
+    // Dropping a BufWriter discards its buffer, so the final flush is explicit.
+    writer.flush().await?;
+    Ok(total_size)
+}
+
 fn auxiliary_token<'a>(filename: &'a str, suffix: &str) -> Option<&'a str> {
     let token = filename.strip_prefix('.')?.strip_suffix(suffix)?;
     (TokenGenerator::parse_path(token) == Some(token)).then_some(token)
@@ -745,6 +732,31 @@ mod tests {
         assert_eq!(sanitized_extension("file.bad-extension"), None);
         assert_eq!(sanitized_extension("file.abcdefghijklmnopq"), None);
         assert_eq!(sanitized_extension("no-extension"), None);
+    }
+
+    #[tokio::test]
+    async fn write_limited_counts_every_chunk_and_maps_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output");
+        let chunks = |parts: Vec<Result<&'static [u8], &'static str>>| {
+            futures_util::stream::iter(parts.into_iter().map(|part| part.map(Bytes::from_static)))
+        };
+        let read_error = |message: &str| AppError::BadRequest(message.to_string());
+
+        let file = File::create(&path).await.unwrap();
+        let size = write_limited(file, chunks(vec![Ok(b"ab"), Ok(b"cd")]), 4, read_error)
+            .await
+            .unwrap();
+        assert_eq!(size, 4);
+        assert_eq!(fs::read(&path).await.unwrap(), b"abcd");
+
+        let file = File::create(&path).await.unwrap();
+        let too_large = write_limited(file, chunks(vec![Ok(b"ab"), Ok(b"cde")]), 4, read_error);
+        assert!(matches!(too_large.await, Err(AppError::PayloadTooLarge)));
+
+        let file = File::create(&path).await.unwrap();
+        let failed = write_limited(file, chunks(vec![Ok(b"ab"), Err("broken")]), 4, read_error);
+        assert!(matches!(failed.await, Err(AppError::BadRequest(message)) if message == "broken"));
     }
 
     #[tokio::test]

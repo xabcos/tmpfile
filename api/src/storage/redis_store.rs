@@ -246,8 +246,8 @@ return new_count
 
         let values: Vec<Option<String>> = self
             .redis_retry("metadata load", |mut conn| {
-                let key = key.clone();
-                async move { conn.hmget(&key, &METADATA_FIELDS).await }
+                let key = &key;
+                async move { conn.hmget(key, &METADATA_FIELDS).await }
             })
             .await?;
         Self::parse_hash_metadata(token, &values)
@@ -262,18 +262,14 @@ return new_count
             return Ok(());
         }
 
-        let tokens = tokens.to_vec();
         self.redis_retry(operation, |mut conn| {
-            let tokens = tokens.clone();
-            async move {
-                let mut pipe = redis::pipe();
-                pipe.atomic();
-                for token in tokens {
-                    pipe.zrem(Self::EXPIRY_SET_KEY, &token)
-                        .zrem(Self::UPLOADED_SET_KEY, &token);
-                }
-                pipe.query_async::<()>(&mut conn).await
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for token in tokens {
+                pipe.zrem(Self::EXPIRY_SET_KEY, token)
+                    .zrem(Self::UPLOADED_SET_KEY, token);
             }
+            async move { pipe.query_async::<()>(&mut conn).await }
         })
         .await
     }
@@ -480,14 +476,12 @@ impl RedisStore {
         desc: bool,
     ) -> AppResult<(Vec<StoredFile>, usize)> {
         if sort_by == FileSort::UploadedAt {
-            let uploaded_count: i64 = self
-                .redis_retry("uploaded set count", |mut conn| async move {
-                    conn.zcard(Self::UPLOADED_SET_KEY).await
-                })
-                .await?;
-            let expiry_count: i64 = self
-                .redis_retry("expiry set count", |mut conn| async move {
-                    conn.zcard(Self::EXPIRY_SET_KEY).await
+            let (uploaded_count, expiry_count): (i64, i64) = self
+                .redis_retry("index set counts", |mut conn| {
+                    let mut pipe = redis::pipe();
+                    pipe.zcard(Self::UPLOADED_SET_KEY)
+                        .zcard(Self::EXPIRY_SET_KEY);
+                    async move { pipe.query_async(&mut conn).await }
                 })
                 .await?;
 
@@ -505,12 +499,12 @@ impl RedisStore {
         loop {
             let (next_cursor, keys): (u64, Vec<String>) = self
                 .redis_retry("metadata scan", |mut conn| {
-                    let pattern = pattern.clone();
+                    let pattern = &pattern;
                     async move {
                         redis::cmd("SCAN")
                             .arg(cursor)
                             .arg("MATCH")
-                            .arg(&pattern)
+                            .arg(pattern)
                             .arg("COUNT")
                             .arg(1000)
                             .query_async(&mut conn)
