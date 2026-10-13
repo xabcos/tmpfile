@@ -38,7 +38,12 @@ does not overwrite the system Nginx configuration. Install it before deploying
 the Rust image that removes application-level CORS. Then set the GitHub Actions
 repository variable `TMPFILE_PAGES_ORIGIN` to the same exact Origin. The API
 deployment job performs a public preflight check and stops before SSH deployment
-if the edge policy is missing or different.
+if the edge policy is missing or different. When the variable is unset, the job
+instead requires a wildcard policy (`Access-Control-Allow-Origin: *` allowing
+`POST`), which is how the shared production Nginx is configured. The
+`Authorization` header must still be listed explicitly, for example
+`Access-Control-Allow-Headers: *, Authorization`, because the Fetch standard
+does not let `*` cover it.
 
 For a custom domain plus a `pages.dev` domain, add a second exact row to the
 rendered `map`. Do not replace the map with `*`. Preview deployment hostnames

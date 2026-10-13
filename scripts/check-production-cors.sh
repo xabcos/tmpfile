@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ "$#" -ne 2 ]]; then
-    echo "usage: $0 <public-upload-url> <exact-pages-origin>" >&2
+    echo "usage: $0 <public-upload-url> <exact-pages-origin or empty for a wildcard policy>" >&2
     exit 2
 fi
 
@@ -16,12 +16,17 @@ if [[ "$upload_url" != https://* && \
     exit 2
 fi
 
-origin_host=${allowed_origin#https://}
-if [[ "$origin_host" == "$allowed_origin" || -z "$origin_host" || \
-    "$origin_host" == */* || "$origin_host" == *\?* || \
-    "$origin_host" == *\#* || "$origin_host" == *@* ]]; then
-    echo "TMPFILE_PAGES_ORIGIN must be one exact https Origin without a path" >&2
-    exit 2
+# An empty origin means the edge must answer every Origin with a wildcard
+# policy, as the shared production nginx does. Otherwise exactly one Origin is
+# allowed and every other Origin must be refused.
+if [[ -n "$allowed_origin" ]]; then
+    origin_host=${allowed_origin#https://}
+    if [[ "$origin_host" == "$allowed_origin" || -z "$origin_host" || \
+        "$origin_host" == */* || "$origin_host" == *\?* || \
+        "$origin_host" == *\#* || "$origin_host" == *@* ]]; then
+        echo "TMPFILE_PAGES_ORIGIN must be one exact https Origin without a path" >&2
+        exit 2
+    fi
 fi
 
 for command in curl grep sed tr; do
@@ -43,7 +48,7 @@ status=$(curl \
     --show-error \
     --max-time 20 \
     --request OPTIONS \
-    --header "Origin: $allowed_origin" \
+    --header "Origin: ${allowed_origin:-https://cors-check.invalid}" \
     --header 'Access-Control-Request-Method: POST' \
     --header 'Access-Control-Request-Headers: authorization,content-type' \
     --dump-header "$headers" \
@@ -71,6 +76,27 @@ assert_header() {
         exit 1
     fi
 }
+
+# Prints the lower-cased comma-separated tokens of a response header, one per
+# line, so that values such as X-Authorization never match a whole token.
+header_tokens() {
+    grep -i "^$1:" "$headers" | cut -d: -f2- | tr ',' '\n' | tr -d ' \t' | \
+        tr '[:upper:]' '[:lower:]'
+}
+
+if [[ -z "$allowed_origin" ]]; then
+    assert_header 'Access-Control-Allow-Origin' '*'
+    # The Fetch standard never lets a `*` in Allow-Headers cover Authorization,
+    # so API-key uploads need it listed explicitly.
+    if ! header_tokens 'Access-Control-Allow-Methods' | grep -Fx -e post -e '*' >/dev/null || \
+        ! header_tokens 'Access-Control-Allow-Headers' | grep -Fx authorization >/dev/null; then
+        echo "production nginx must allow POST and list the Authorization header explicitly" >&2
+        sed -n '1,120p' "$headers" >&2
+        exit 1
+    fi
+    echo "Production nginx wildcard CORS preflight check passed."
+    exit 0
+fi
 
 assert_header 'Access-Control-Allow-Origin' "$allowed_origin"
 assert_header 'Access-Control-Allow-Methods' 'GET, HEAD, POST, OPTIONS'

@@ -93,6 +93,19 @@ python3 - "$backend_port" >"$tmp_dir/backend.log" 2>&1 <<'PY' &
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Direct preflight fixtures for the production checker's wildcard mode:
+# (Allow-Origin, Allow-Methods, Allow-Headers). Nginx answers OPTIONS itself,
+# so these are only reachable on the backend port.
+WILDCARD_CASES = {
+    "/wildcard/star-authorization": ("*", "GET,POST,PUT,DELETE,OPTIONS,PATCH", "*, Authorization"),
+    "/wildcard/listed": ("*", "GET, POST", "Content-Type, Authorization"),
+    "/wildcard/star": ("*", "GET,POST,PUT,DELETE,OPTIONS,PATCH", "*"),
+    "/wildcard/x-authorization": ("*", "GET, POST", "X-Authorization, Content-Type"),
+    "/wildcard/x-star": ("*", "GET, POST", "Content-Type, X-*"),
+    "/wildcard/x-post": ("*", "GET, X-POST", "*, Authorization"),
+    "/wildcard/exact-origin": ("https://pages.example.test", "GET, POST", "*"),
+}
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -119,6 +132,14 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(401, b"missing authorization")
         else:
             self.respond(200, b"uploaded")
+
+    def do_OPTIONS(self):
+        origin, methods, headers = WILDCARD_CASES[self.path]
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", methods)
+        self.send_header("Access-Control-Allow-Headers", headers)
+        self.end_headers()
 
     def log_message(self, _format, *_args):
         pass
@@ -234,5 +255,27 @@ assert_header "$upstream_error" 'Access-Control-Allow-Origin' "$allowed_origin"
 # Exercise the same public-readiness checker used by the deployment workflow.
 TMPFILE_CORS_CHECK_ALLOW_HTTP=1 \
     "$repo_root/scripts/check-production-cors.sh" "$url" "$allowed_origin"
+
+# Without an exact origin the checker demands a wildcard policy, so this
+# exact-origin template must fail it.
+if TMPFILE_CORS_CHECK_ALLOW_HTTP=1 \
+    "$repo_root/scripts/check-production-cors.sh" "$url" "" >/dev/null 2>&1; then
+    echo "wildcard production check accepted an exact-origin policy" >&2
+    exit 1
+fi
+
+# The wildcard mode must compare whole header tokens.
+backend_url="http://127.0.0.1:$backend_port/wildcard"
+for case in star-authorization listed; do
+    TMPFILE_CORS_CHECK_ALLOW_HTTP=1 \
+        "$repo_root/scripts/check-production-cors.sh" "$backend_url/$case" "" >/dev/null
+done
+for case in star x-authorization x-star x-post exact-origin; do
+    if TMPFILE_CORS_CHECK_ALLOW_HTTP=1 \
+        "$repo_root/scripts/check-production-cors.sh" "$backend_url/$case" "" >/dev/null 2>&1; then
+        echo "wildcard production check accepted the $case policy" >&2
+        exit 1
+    fi
+done
 
 echo "Nginx syntax and CORS behavior checks passed."

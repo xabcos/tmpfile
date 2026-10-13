@@ -8,12 +8,14 @@ on:
       - 'api/**'
       - '.dockerignore'
       - 'Makefile'
+      - 'scripts/check-production-cors.sh'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
       - 'api/**'
       - '.dockerignore'
       - 'Makefile'
+      - 'scripts/check-production-cors.sh'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -136,7 +138,7 @@ jobs:
     - name: Verify production nginx CORS is active
       env:
         TMPFILE_PAGES_ORIGIN: ${{ vars.TMPFILE_PAGES_ORIGIN }}
-      run: ./scripts/check-production-cors.sh https://dl.xabclabs.com/upload "$TMPFILE_PAGES_ORIGIN"
+      run: ./scripts/check-production-cors.sh https://dl.xabcnews.com/upload "$TMPFILE_PAGES_ORIGIN"
 
     - name: Get repo name
       run: echo "REPO_NAME=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_ENV"
@@ -149,7 +151,7 @@ jobs:
         key: ${{ secrets.PROD_KEY }}
         script: |
           set -e
-          cd /home/${{ secrets.DOCKER_HUB_USERNAME }}/1/${{ env.REPO_NAME }}
+          cd /home/ywgx/1/${{ env.REPO_NAME }}
           docker-compose -f docker-compose.yml pull
           docker-compose -f docker-compose.yml up -d
           docker image prune --all --force

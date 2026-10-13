@@ -91,6 +91,9 @@ Before production deployment:
    `deploy/nginx/tmpfile.conf.template`, validate it, and reload Nginx.
 4. Set the GitHub Actions repository variable `TMPFILE_PAGES_ORIGIN` to that
    exact Origin; API deployment is blocked until its public preflight succeeds.
+   Leave it unset only when the edge deliberately uses a wildcard policy; the
+   preflight check then requires `Access-Control-Allow-Origin: *` with
+   `Authorization` listed explicitly in `Access-Control-Allow-Headers`.
 5. Never commit `API_KEY` into `pages/`; the UI accepts it at runtime and keeps
    it only in the current tab's `sessionStorage`.
 
