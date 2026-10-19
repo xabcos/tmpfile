@@ -37,9 +37,22 @@ body {
   display: grid;
 }
 
-.config-toggle {
-  display: block;
-  margin: 0 0 0.5rem auto;
+/* Settings and the source on GitHub, top right. */
+.topbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.source-link {
+  display: inline-flex;
+  color: #666;
+}
+
+.source-link:hover {
+  color: #333;
 }
 
 input[type="text"], input[type="password"] {
@@ -293,7 +306,10 @@ window.addEventListener('load', () => {
 </head>
 <body>
 <div class="container">
-  <button type="button" class="btn-text config-toggle" id="configToggle" aria-controls="config">Settings</button>
+  <div class="topbar">
+    <button type="button" class="btn-text" id="configToggle" aria-controls="config">Settings</button>
+    <a class="source-link" href="https://github.com/xabcos/tmpfile" target="_blank" rel="noopener noreferrer" aria-label="Source on GitHub · AGPL-3.0" title="Source on GitHub · AGPL-3.0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg></a>
+  </div>
   <div class="config" id="config">
     <input type="text" id="serverUrl" placeholder="Server URL">
     <input type="password" id="apiKey" placeholder="API Key (optional)">
