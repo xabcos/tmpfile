@@ -377,7 +377,7 @@ const normalizeDirectLink = (value, serverUrl) => {
     const server = new URL(serverUrl);
     if (!['http:', 'https:'].includes(url.protocol)) return '';
     if (url.protocol === 'http:' &&
-        (url.hostname === 'dl.xabclabs.com' || server.protocol === 'https:' && server.host === url.host)) {
+        (url.hostname === 'dl.xabcnews.com' || server.protocol === 'https:' && server.host === url.host)) {
       url.protocol = 'https:';
     }
     return url.href;

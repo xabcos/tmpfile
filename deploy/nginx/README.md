@@ -50,7 +50,7 @@ rendered `map`. Do not replace the map with `*`. Preview deployment hostnames
 must also be listed explicitly if they need API access.
 
 The checked-in server listens on port 80 for an existing TLS/Cloudflare edge and
-uses `server_name dl.xabclabs.com`. Add the site's certificate/listen directives
+uses `server_name dl.xabcnews.com`. Add the site's certificate/listen directives
 when Nginx itself terminates public TLS.
 
 For local browser testing, render `http://127.0.0.1:8788` as the allowed Origin,
@@ -64,7 +64,7 @@ curl/API-only endpoint.
   do not share the host network.
 - A containerized API must listen on `0.0.0.0:8080` internally but publish only
   `127.0.0.1:8080` on the host.
-- Production must set `PUBLIC_BASE_URL=https://dl.xabclabs.com`; Nginx also
+- Production must set `PUBLIC_BASE_URL=https://dl.xabcnews.com`; Nginx also
   overwrites `Host` and `X-Forwarded-Proto`.
 - The 257 MiB Nginx body limit leaves framing room above the API's 256 MiB file
   limit. Keep both limits coordinated if either changes.
@@ -92,6 +92,6 @@ Run the same read-only production readiness check used by CI with:
 
 ```bash
 ./scripts/check-production-cors.sh \
-  https://dl.xabclabs.com/upload \
+  https://dl.xabcnews.com/upload \
   https://your-project.pages.dev
 ```

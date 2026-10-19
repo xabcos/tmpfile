@@ -16,7 +16,7 @@ upstream tmpfile_api {
 server {
     listen 80;
     listen [::]:80;
-    server_name dl.xabclabs.com;
+    server_name dl.xabcnews.com;
 
     # MAX_FILE_SIZE is 256 MiB; leave room for multipart framing.
     client_max_body_size 257m;

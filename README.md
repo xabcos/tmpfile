@@ -51,7 +51,7 @@ python3 -m http.server 8788 --directory pages
 ```
 
 Open `http://127.0.0.1:8788`. The copied UI defaults to
-`https://dl.xabclabs.com`. Test the local Rust API directly with curl at
+`https://dl.xabcnews.com`. Test the local Rust API directly with curl at
 `http://127.0.0.1:8080`. Browser uploads from port 8788 must instead use a
 rendered Nginx endpoint because Rust intentionally owns no CORS policy; do not
 point the browser straight at port 8080. See
@@ -84,7 +84,7 @@ npx wrangler pages deploy pages
 Before production deployment:
 
 1. Set the page's default Server URL in `pages/config.js` if the API is not
-   `https://dl.xabclabs.com`.
+   `https://dl.xabcnews.com`.
 2. Set API `PUBLIC_BASE_URL` to the public API/download origin, not to the Pages
    origin.
 3. Render the exact production Pages origin into
@@ -281,7 +281,7 @@ Run the API image:
 
 ```bash
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e PUBLIC_BASE_URL=https://dl.xabclabs.com \
+  -e PUBLIC_BASE_URL=https://dl.xabcnews.com \
   -v tmpfile_uploads:/home/nonroot/uploads \
   proxyxai/tmpfile:rust
 ```
@@ -298,3 +298,14 @@ Pages.
   safe to reuse for their cache lifetime.
 - Keep the API port private, use the exact Nginx Origin map, and keep API keys
   out of static assets.
+
+## License
+
+Licensed under the [AGPL-3.0](LICENSE). Anyone who offers a modified version as a
+network service must make its complete source available to that service's users
+under the same license; a commercial license outside the AGPL can be arranged with
+the author.
+
+The XABC and xabcnews names and the site icons in `pages/` (`favicon.ico`,
+`apple-touch-icon*.png`, `x.svg`, `xabc.svg`) are not covered by the license; forks
+should use their own.
